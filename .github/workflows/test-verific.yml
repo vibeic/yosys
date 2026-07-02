@@ -55,7 +55,7 @@ jobs:
 
       - name: Build Yosys
         run: |
-          rm -rf build Configuration.cmake
+          rm -rf build Configuration.cmake coverage
           echo 'set(CMAKE_C_COMPILER clang CACHE STRING "")' >> Configuration.cmake
           echo 'set(CMAKE_CXX_COMPILER clang++ CACHE STRING "")' >> Configuration.cmake
           echo 'set(YOSYS_COMPILER_LAUNCHER ccache CACHE STRING "")' >> Configuration.cmake
@@ -118,6 +118,13 @@ jobs:
           else
             echo "No changes to commit"
           fi
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: YosysHQ/yosys
+          files: build/coverage.info
 
   test-pyosys:
     needs: pre_job
