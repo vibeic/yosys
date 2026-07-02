@@ -49,11 +49,6 @@ jobs:
           echo "LLVM_PROFILE_FILE_BUFFER_SIZE=0" >> $GITHUB_ENV
           echo "SEED=0" >> $GITHUB_ENV
 
-      - name: Skip generating files
-        if: ${{ github.event_name != 'merge_group' && github.event_name != 'workflow_dispatch' }}
-        run: |
-          echo "LLVM_PROFILE_FILE=/dev/null" >> $GITHUB_ENV
-
       - name: Build Yosys
         run: |
           rm -rf build Configuration.cmake coverage
@@ -90,13 +85,7 @@ jobs:
           make -C tests/sva
           make -C tests/svtypes
 
-      - name: Run SBY tests
-        if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' }}
-        run: |
-          make -C sby run_ci
-
       - name: Run coverage
-        if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' }}
         run: |
           make -C tests coverage
           make -C tests clean_coverage
@@ -126,6 +115,16 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: YosysHQ/yosys
           files: build/coverage.info
+
+      - name: Skip generating files
+        if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' }}
+        run: |
+          echo "LLVM_PROFILE_FILE=/dev/null" >> $GITHUB_ENV
+
+      - name: Run SBY tests
+        if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' }}
+        run: |
+          make -C sby run_ci
 
   test-pyosys:
     needs: pre_job
