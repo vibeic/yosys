@@ -116,6 +116,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: YosysHQ/yosys
           files: build/coverage.info
+          disable_search: true
 
       - name: Skip generating files
         if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' }}
