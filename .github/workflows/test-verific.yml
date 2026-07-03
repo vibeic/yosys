@@ -48,6 +48,7 @@ jobs:
           echo "LLVM_PROFILE_FILE=${GITHUB_WORKSPACE}/coverage/coverage_%p.profraw" >> $GITHUB_ENV
           echo "LLVM_PROFILE_FILE_BUFFER_SIZE=0" >> $GITHUB_ENV
           echo "SEED=0" >> $GITHUB_ENV
+          echo "ENABLE_FUNCTIONAL_TESTS=1" >> $GITHUB_ENV
 
       - name: Build Yosys
         run: |
