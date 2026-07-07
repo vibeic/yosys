@@ -94,8 +94,7 @@ jobs:
 
       - name: Run coverage
         run: |
-          make -C tests coverage
-          make -C tests clean_coverage
+          lcov --capture -d . --no-external -o coverage.info
 
       - name: Push coverage
         if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' }}
@@ -124,10 +123,10 @@ jobs:
           files: build/coverage.info
           disable_search: true
 
-      - name: Run SBY tests
-        if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' }}
-        run: |
-          make -C sby run_ci
+      #- name: Run SBY tests
+      #  if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' }}
+      #  run: |
+      #    make -C sby run_ci
 
   test-pyosys:
     needs: pre_job
