@@ -59,8 +59,8 @@ jobs:
       - name: Build Yosys
         run: |
           rm -rf build Configuration.cmake coverage
-          echo 'set(CMAKE_C_COMPILER gcc CACHE STRING "")' >> Configuration.cmake
-          echo 'set(CMAKE_CXX_COMPILER g++ CACHE STRING "")' >> Configuration.cmake
+          echo 'set(CMAKE_C_COMPILER clang CACHE STRING "")' >> Configuration.cmake
+          echo 'set(CMAKE_CXX_COMPILER clang++ CACHE STRING "")' >> Configuration.cmake
           echo 'set(YOSYS_COMPILER_LAUNCHER ccache CACHE STRING "")' >> Configuration.cmake
           echo 'set(YOSYS_ENABLE_COVERAGE ON CACHE BOOL "")' >> Configuration.cmake
           echo 'set(YOSYS_VERIFIC_DIR "/usr/local/src/verific_lib" CACHE STRING "")' >> Configuration.cmake
@@ -94,7 +94,9 @@ jobs:
 
       - name: Run coverage
         run: |
-          lcov -c -q -o coverage.info --gcov-tool gcov --config-file ${GITHUB_WORKSPACE}/.lcovrc -d build
+          lcov -c -q -o coverage.info --gcov-tool "llvm-cov-18 gcov" --config-file ${GITHUB_WORKSPACE}/.lcovrc -d build
+
+      #lcov -c -q -o coverage.info --gcov-tool gcov --config-file ${GITHUB_WORKSPACE}/.lcovrc -d build
 
       #- name: Push coverage
       #  if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' }}
