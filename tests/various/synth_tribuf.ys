@@ -1,0 +1,26 @@
+# vibeic fork: regression test for tri-state fanin preservation in `synth`.
+# `synth` runs `tribuf -logic` by default so that the tri-state enable
+# fanin of `assign io = oe ? val : 1'bz` survives as $_TBUF_ cells rather
+# than being dropped by opt as a don't-care (which produced `assign io = val`).
+
+read_verilog <<EOT
+module tri_top(input oe, input [3:0] val, output [3:0] io);
+	assign io = oe ? val : 4'bz;
+endmodule
+EOT
+
+# default: tri-state buffers are inferred and their enable (oe) is preserved
+synth -top tri_top
+select -assert-count 4 t:$_TBUF_
+select -assert-any t:$_TBUF_ %x:+[E] i:oe %i
+
+design -reset
+
+# -notribuf restores the historic behaviour (tri-state lowered to plain logic)
+read_verilog <<EOT
+module tri_top(input oe, input [3:0] val, output [3:0] io);
+	assign io = oe ? val : 4'bz;
+endmodule
+EOT
+synth -top tri_top -notribuf
+select -assert-count 0 t:$_TBUF_
