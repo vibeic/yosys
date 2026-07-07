@@ -41,14 +41,21 @@ jobs:
         with:
           persist-credentials: false
           submodules: true
+      - name: Install dependencies
+        run: |
+          wget --quiet https://github.com/linux-test-project/lcov/releases/download/v2.4/lcov-2.4.tar.gz
+          tar -xf lcov-2.4.tar.gz
+          cd lcov-2.4
+          sudo make install
+          sudo cpan App::cpanminus
+          sudo cpanm --notest Capture::Tiny DateTime
       - name: Runtime environment
         run: |
           echo "procs=$(nproc)" >> $GITHUB_ENV
           mkdir -p "${GITHUB_WORKSPACE}/coverage"
-          echo "LLVM_PROFILE_FILE=${GITHUB_WORKSPACE}/coverage/coverage_%p.profraw" >> $GITHUB_ENV
-          echo "LLVM_PROFILE_FILE_BUFFER_SIZE=0" >> $GITHUB_ENV
           echo "SEED=0" >> $GITHUB_ENV
           echo "ENABLE_FUNCTIONAL_TESTS=1" >> $GITHUB_ENV
+          echo "PATH=/usr/local/bin:$PATH" >> "$GITHUB_ENV"
 
       - name: Build Yosys
         run: |
@@ -117,11 +124,6 @@ jobs:
           slug: YosysHQ/yosys
           files: build/coverage.info
           disable_search: true
-
-      - name: Skip generating files
-        if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' }}
-        run: |
-          echo "LLVM_PROFILE_FILE=/dev/null" >> $GITHUB_ENV
 
       - name: Run SBY tests
         if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' }}
