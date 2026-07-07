@@ -37,4 +37,4 @@ branch_coverage = 0
 geninfo_unexecuted_blocks = 1
 
 filter = brace,blank,directive,region,function,trivial
-ignore_errors = negative,inconsistent,corrupt
+ignore_errors = negative,inconsistent,corrupt,range
