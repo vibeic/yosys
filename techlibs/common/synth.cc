@@ -81,6 +81,12 @@ struct SynthPass : public ScriptPass {
 		log("    -noshare\n");
 		log("        do not run SAT-based resource sharing\n");
 		log("\n");
+		log("    -notribuf\n");
+		log("        do not run the 'tribuf' pass. by default 'synth' runs\n");
+		log("        'tribuf -logic' so that tri-state driver fanin (e.g.\n");
+		log("        'assign io = oe ? val : 1'bz') is preserved as a $_TBUF_\n");
+		log("        cell instead of being dropped by opt as a don't-care.\n");
+		log("\n");
 		log("    -run <from_label>[:<to_label>]\n");
 		log("        only run the commands between the labels (see below). an empty\n");
 		log("        from label is synonymous to 'begin', and empty to label is\n");
@@ -113,6 +119,10 @@ struct SynthPass : public ScriptPass {
 
 	string top_module, fsm_opts, memory_opts, abc;
 	bool autotop, flatten, noalumacc, nofsm, noabc, noshare, flowmap, booth, arith_tree, hieropt, relative_share;
+	// vibeic fork: run 'tribuf -logic' by default so tri-state driver fanin
+	// (e.g. `assign io = oe ? val : 1'bz`) is preserved as a $_TBUF_ cell and
+	// is not dropped by opt as a don't-care. -notribuf restores old behaviour.
+	bool notribuf;
 	int lut;
 	std::vector<std::string> techmap_maps;
 
@@ -129,6 +139,7 @@ struct SynthPass : public ScriptPass {
 		nofsm = false;
 		noabc = false;
 		noshare = false;
+		notribuf = false; // vibeic fork
 		flowmap = false;
 		booth = false;
 		arith_tree = false;
@@ -204,6 +215,10 @@ struct SynthPass : public ScriptPass {
 				noshare = true;
 				continue;
 			}
+			if (args[argidx] == "-notribuf") { // vibeic fork
+				notribuf = true;
+				continue;
+			}
 			if (args[argidx] == "-abc9") {
 				abc = "abc9";
 				continue;
@@ -277,6 +292,13 @@ struct SynthPass : public ScriptPass {
 
 		if (check_label("coarse")) {
 			run("proc");
+			// vibeic fork: lower tri-state constructs to $_TBUF_ cells right
+			// after 'proc', before opt can drop the enable fanin as a
+			// don't-care. 'tribuf -logic' keeps output-port tri-states as
+			// $_TBUF_ (the ASIC inout/io-pad case) and converts internal-only
+			// tri-states to ordinary logic. No-op on designs without tri-state.
+			if (!notribuf || help_mode)
+				run("tribuf -logic", "   (unless -notribuf)");
 			if (flatten || help_mode) {
 				run("check");
 				run("flatten", "  (if -flatten)");
