@@ -94,7 +94,9 @@ jobs:
 
       - name: Run coverage
         run: |
-          lcov -c -q -o coverage.info --gcov-tool "llvm-cov-18 gcov" --config-file ${GITHUB_WORKSPACE}/.lcovrc -d build
+          printf '#!/bin/sh\nexec llvm-cov-18 gcov "$@"\n' > /tmp/llvm-gcov-18
+          chmod +x /tmp/llvm-gcov-18
+          lcov -c -q -o coverage.info --gcov-tool /tmp/llvm-gcov-18 --config-file ${GITHUB_WORKSPACE}/.lcovrc -d build
 
       #lcov -c -q -o coverage.info --gcov-tool gcov --config-file ${GITHUB_WORKSPACE}/.lcovrc -d build
 
