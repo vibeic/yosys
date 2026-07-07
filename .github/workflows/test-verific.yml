@@ -120,7 +120,7 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: YosysHQ/yosys
-          files: build/coverage.info
+          files: coverage.info
           disable_search: true
 
       #- name: Run SBY tests
