@@ -80,6 +80,9 @@ static void logmap_all()
 	logmap(ID($_DFFSR_PNP_));
 	logmap(ID($_DFFSR_PPN_));
 	logmap(ID($_DFFSR_PPP_));
+
+	logmap(ID($_DLATCH_N_));
+	logmap(ID($_DLATCH_P_));
 }
 
 static bool parse_next_state(const LibertyAst *cell, const LibertyAst *attr, std::string &data_name, bool &data_not_inverted, std::string &enable_name, bool &enable_not_inverted)
@@ -493,6 +496,126 @@ static void find_cell_sr(std::vector<const LibertyAst *> cells, IdString cell_ty
 	}
 }
 
+static void find_latch(std::vector<const LibertyAst *> cells, IdString cell_type, bool enpol, std::vector<std::string> &dont_use_cells)
+{
+	// Map a level-sensitive D-latch ($_DLATCH_N_/$_DLATCH_P_) to a liberty `latch`
+	// group. This mirrors find_cell() for flip-flops but reads the liberty `latch`
+	// group (enable/data_in) instead of the `ff` group (clocked_on/next_state).
+	// abc's sequential model (.latch) is edge-triggered and cannot carry a
+	// level-sensitive latch, so - exactly like DFFs - latch technology mapping is
+	// performed here by direct liberty-cell substitution, not through abc.
+	const LibertyAst *best_cell = nullptr;
+	std::map<std::string, char> best_cell_ports;
+	int best_cell_pins = 0;
+	bool best_cell_noninv = false;
+	double best_cell_area = 0;
+
+	for (auto cell : cells)
+	{
+		const LibertyAst *dn = cell->find("dont_use");
+		if (dn != nullptr && dn->value == "true")
+			continue;
+
+		bool dont_use = false;
+		for (std::string &dont_use_cell : dont_use_cells)
+		{
+			if (patmatch(dont_use_cell.c_str(), cell->args[0].c_str()))
+			{
+				dont_use = true;
+				break;
+			}
+		}
+		if (dont_use)
+			continue;
+
+		const LibertyAst *latch = cell->find("latch");
+		if (latch == nullptr)
+			continue;
+		if (latch->args.empty())
+			continue;
+
+		std::string cell_en_pin, cell_data_pin;
+		bool cell_en_pol, cell_data_pol;
+
+		// enable must exist and match the requested latch polarity (active-high for
+		// $_DLATCH_P_, active-low for $_DLATCH_N_).
+		if (!parse_pin(cell, latch->find("enable"), cell_en_pin, cell_en_pol) || cell_en_pol != enpol)
+			continue;
+		if (!parse_pin(cell, latch->find("data_in"), cell_data_pin, cell_data_pol))
+			continue;
+
+		std::map<std::string, char> this_cell_ports;
+		this_cell_ports[cell_en_pin] = 'E';
+		this_cell_ports[cell_data_pin] = 'D';
+
+		double area = 0;
+		const LibertyAst *ar = cell->find("area");
+		if (ar != nullptr && !ar->value.empty())
+			area = atof(ar->value.c_str());
+
+		int num_pins = 0;
+		bool found_output = false;
+		bool found_noninv_output = false;
+		for (auto pin : cell->children)
+		{
+			if (pin->id != "pin" || pin->args.size() != 1)
+				continue;
+
+			const LibertyAst *dir = pin->find("direction");
+			if (dir == nullptr || dir->value == "internal")
+				continue;
+			num_pins++;
+
+			if (dir->value == "input" && this_cell_ports.count(pin->args[0]) == 0)
+				goto continue_latch_loop;
+
+			const LibertyAst *func = pin->find("function");
+			if (dir->value == "output" && func != nullptr) {
+				std::string value = func->value;
+				for (size_t pos = value.find_first_of("\" \t"); pos != std::string::npos; pos = value.find_first_of("\" \t"))
+					value.erase(pos, 1);
+				// latch->args[0] is the (non-inverted) state variable, args[1] the inverted one.
+				// If data_in is inverted, the Q/Qn roles swap (same convention as find_cell).
+				if (value == latch->args[0]) {
+					this_cell_ports[pin->args[0]] = cell_data_pol ? 'Q' : 'q';
+					if (cell_data_pol)
+						found_noninv_output = true;
+					found_output = true;
+				} else
+				if (latch->args.size() >= 2 && value == latch->args[1]) {
+					this_cell_ports[pin->args[0]] = cell_data_pol ? 'q' : 'Q';
+					if (!cell_data_pol)
+						found_noninv_output = true;
+					found_output = true;
+				}
+			}
+
+			if (this_cell_ports.count(pin->args[0]) == 0)
+				this_cell_ports[pin->args[0]] = 0;
+		}
+
+		if (!found_output || (best_cell != nullptr && (num_pins > best_cell_pins || (best_cell_noninv && !found_noninv_output))))
+			continue;
+
+		if (best_cell != nullptr && num_pins == best_cell_pins && area > best_cell_area)
+			continue;
+
+		best_cell = cell;
+		best_cell_pins = num_pins;
+		best_cell_area = area;
+		best_cell_noninv = found_noninv_output;
+		best_cell_ports.swap(this_cell_ports);
+	continue_latch_loop:;
+	}
+
+	if (best_cell != nullptr) {
+		log("  cell %s (%sinv, pins=%d, area=%.2f) is a direct match for cell type %s.\n",
+				best_cell->args[0].c_str(), best_cell_noninv ? "non" : "", best_cell_pins, best_cell_area, cell_type.c_str());
+		cell_mappings[cell_type].cell_name = RTLIL::escape_id(best_cell->args[0]);
+		cell_mappings[cell_type].ports = best_cell_ports;
+	}
+}
+
 static void dfflibmap(RTLIL::Design *design, RTLIL::Module *module)
 {
 	log("Mapping DFF cells in module `%s':\n", module->name);
@@ -576,6 +699,9 @@ struct DfflibmapPass : public Pass {
 		log("\n");
 		log("Map internal flip-flop cells to the flip-flop cells in the technology\n");
 		log("library specified in the given liberty files.\n");
+		log("\n");
+		log("Internal level-sensitive D-latch cells ($_DLATCH_[NP]_) are also mapped to\n");
+		log("matching `latch' cells (enable/data_in) from the liberty files, when present.\n");
 		log("\n");
 		log("This pass may add inverters as needed. Therefore it is recommended to\n");
 		log("first run this pass and then map the logic paths to the target technology.\n");
@@ -686,6 +812,9 @@ struct DfflibmapPass : public Pass {
 		find_cell_sr(merged.cells, ID($_DFFSR_PPN_), true, true, false, false, false, dont_use_cells);
 		find_cell_sr(merged.cells, ID($_DFFSR_PPP_), true, true, true, false, false, dont_use_cells);
 
+		find_latch(merged.cells, ID($_DLATCH_N_), false, dont_use_cells);
+		find_latch(merged.cells, ID($_DLATCH_P_), true, dont_use_cells);
+
 		log("  final dff cell mappings:\n");
 		logmap_all();
 
@@ -694,6 +823,11 @@ struct DfflibmapPass : public Pass {
 			for (auto it : cell_mappings)
 				dfflegalize_cmd += stringf(" -cell %s 01", it.first);
 			dfflegalize_cmd += " t:$_DFF* t:$_SDFF*";
+			// Only legalize D-latches when the liberty actually provides a latch cell
+			// to map them to; otherwise leave them untouched (same as the pre-latch
+			// behaviour) so a latch-free library never triggers latch emulation.
+			if (cell_mappings.count(ID($_DLATCH_N_)) || cell_mappings.count(ID($_DLATCH_P_)))
+				dfflegalize_cmd += " t:$_DLATCH_?_";
 			if (info_mode) {
 				log("dfflegalize command line: %s\n", dfflegalize_cmd);
 			} else {
