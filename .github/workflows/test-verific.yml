@@ -94,7 +94,7 @@ jobs:
 
       - name: Run coverage
         run: |
-          lcov --capture -d . --no-external -o coverage.info
+          lcov -c -q -o coverage.info --gcov-tool gcov --config-file ${GITHUB_WORKSPACE}/.lcovrc -d build
 
       - name: Push coverage
         if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' }}
