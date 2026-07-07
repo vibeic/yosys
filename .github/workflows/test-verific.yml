@@ -54,14 +54,13 @@ jobs:
           echo "procs=$(nproc)" >> $GITHUB_ENV
           mkdir -p "${GITHUB_WORKSPACE}/coverage"
           echo "SEED=0" >> $GITHUB_ENV
-          echo "ENABLE_FUNCTIONAL_TESTS=1" >> $GITHUB_ENV
           echo "PATH=/usr/local/bin:$PATH" >> "$GITHUB_ENV"
 
       - name: Build Yosys
         run: |
           rm -rf build Configuration.cmake coverage
-          echo 'set(CMAKE_C_COMPILER clang CACHE STRING "")' >> Configuration.cmake
-          echo 'set(CMAKE_CXX_COMPILER clang++ CACHE STRING "")' >> Configuration.cmake
+          echo 'set(CMAKE_C_COMPILER gcc CACHE STRING "")' >> Configuration.cmake
+          echo 'set(CMAKE_CXX_COMPILER g++ CACHE STRING "")' >> Configuration.cmake
           echo 'set(YOSYS_COMPILER_LAUNCHER ccache CACHE STRING "")' >> Configuration.cmake
           echo 'set(YOSYS_ENABLE_COVERAGE ON CACHE BOOL "")' >> Configuration.cmake
           echo 'set(YOSYS_VERIFIC_DIR "/usr/local/src/verific_lib" CACHE STRING "")' >> Configuration.cmake
