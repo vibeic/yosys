@@ -67,11 +67,21 @@ struct LiftAdderWorker
 
 		// --- fanout (input-port consumers) of every net + module outputs -----
 		dict<SigBit, int> fanout;
-		for (auto cell : module->cells())
+		for (auto cell : module->cells()) {
+			// For a cell whose type is UNRESOLVED (an undefined module, or a
+			// blackbox declared without port directions), Cell::input() returns
+			// false for every port, so a real consumer of an internal carry would
+			// be undercounted and the private-carry check could wrongly pass.
+			// Conservatively treat EVERY connected bit of such a cell as a
+			// consumer, so any carry it observes trips the fanout!=1 bail. (On a
+			// hierarchy-resolved netlist no such cell exists; this keeps the "a
+			// wrong lift never happens" guarantee true even standalone.)
+			bool dirs_known = cell->known();
 			for (auto &conn : cell->connections())
-				if (cell->input(conn.first))
+				if (!dirs_known || cell->input(conn.first))
 					for (auto bit : sigmap(conn.second))
 						fanout[bit]++;
+		}
 		pool<SigBit> output_bits;
 		for (auto wire : module->wires())
 			if (wire->port_output)
