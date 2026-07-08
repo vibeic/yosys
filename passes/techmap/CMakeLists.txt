@@ -123,6 +123,9 @@ yosys_pass(extract
 yosys_pass(extract_fa
 	extract_fa.cc
 )
+yosys_pass(lift_adder
+	lift_adder.cc
+)
 yosys_pass(extract_counter
 	extract_counter.cc
 )
