@@ -441,7 +441,8 @@ struct statdata_t {
 	}
 
 	void print_log_line(const std::string &name, unsigned int count_local, double area_local, unsigned int count_global, double area_global,
-			    int spacer = 0, bool print_area = true, bool print_hierarchical = true, bool print_global_only = false)
+			    int spacer = 0, bool print_area = true, bool print_hierarchical = true, bool print_global_only = false,
+			    bool always_print_local = false)
 	{
 		const std::string indent(2 * spacer, ' ');
 
@@ -457,8 +458,11 @@ struct statdata_t {
 			} else if (print_global_only) {
 				log(" %s %s %s%s\n", count_global_str, area_global_str, indent, name);
 			} else {
-				if (count_local > 0)
+				if (count_local > 0 || always_print_local) {
+					if (count_local == 0)
+						count_local_str = "       0"; // explicit zero instead of the '-' placeholder
 					log(" %s %s %s%s\n", count_local_str, area_local_str, indent, name);
+				}
 			}
 		} else {
 			if (print_hierarchical) {
@@ -466,8 +470,11 @@ struct statdata_t {
 			} else if (print_global_only) {
 				log(" %s %s%s\n", count_global_str, indent, name);
 			} else {
-				if (count_local > 0)
+				if (count_local > 0 || always_print_local) {
+					if (count_local == 0)
+						count_local_str = "       0"; // explicit zero instead of the '-' placeholder
 					log(" %s %s%s\n", count_local_str, indent, name);
+				}
 			}
 		}
 	}
@@ -520,7 +527,11 @@ struct statdata_t {
 		print_log_line("memories", local_num_memories, 0, num_memories, 0, 0, print_area, print_hierarchical, print_global_only);
 		print_log_line("memory bits", local_num_memory_bits, 0, num_memory_bits, 0, 0, print_area, print_hierarchical, print_global_only);
 		print_log_line("processes", local_num_processes, 0, num_processes, 0, 0, print_area, print_hierarchical, print_global_only);
-		print_log_line("cells", local_num_cells, local_area, num_cells, area, 0, print_area, print_hierarchical, print_global_only);
+		// vibeic/vibe-ic#124: always print the total cells row, even when the count
+		// is zero (wiring-only modules), so downstream parsers can rely on its presence.
+		// Per-cell-type rows below are still omitted when empty.
+		print_log_line("cells", local_num_cells, local_area, num_cells, area, 0, print_area, print_hierarchical, print_global_only,
+			       /*always_print_local=*/true);
 		for (auto &it : num_cells_by_type)
 			if (it.second) {
 				auto name = string(it.first.unescape());

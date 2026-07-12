@@ -1,0 +1,38 @@
+# vibeic/vibe-ic#124: the columnar `stat` output must always print the total
+# cells row, even for a module with zero cells (e.g. wiring-only modules),
+# so downstream parsers can rely on the row being present.
+# Per-cell-type rows are still omitted when there are no cells.
+
+read_verilog <<EOT
+module w(input [3:0] a, output [3:0] y);
+  assign y = {a[0],a[1],a[2],a[3]};
+endmodule
+EOT
+logger -expect log "       0 cells" 1
+logger -expect-no-warnings
+stat
+
+# Same guarantee for the area-annotated (-liberty) column format: the design
+# needs one module with liberty area so the area columns engage, plus a
+# wiring-only module whose cells row must still be printed (as zero).
+design -reset
+read_rtlil <<EOT
+module \top
+  wire input 1 \A
+  wire output 2 \Y
+  cell \sg13g2_and2_1 \sub
+    connect \A \A
+    connect \B 1'0
+    connect \Y \Y
+  end
+end
+module \w2
+  wire input 1 \A
+  wire output 2 \Y
+  connect \Y \A
+end
+EOT
+logger -expect log "       0        - cells" 1
+logger -expect log "        1    9.072 cells" 1
+logger -expect-no-warnings
+stat -liberty ../../tests/liberty/foundry_data/sg13g2_stdcell_typ_1p20V_25C.lib.filtered.gz
