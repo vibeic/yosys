@@ -441,7 +441,8 @@ struct statdata_t {
 	}
 
 	void print_log_line(const std::string &name, unsigned int count_local, double area_local, unsigned int count_global, double area_global,
-			    int spacer = 0, bool print_area = true, bool print_hierarchical = true, bool print_global_only = false)
+			    int spacer = 0, bool print_area = true, bool print_hierarchical = true, bool print_global_only = false,
+			    bool always_print = false)
 	{
 		const std::string indent(2 * spacer, ' ');
 
@@ -450,6 +451,19 @@ struct statdata_t {
 		std::string area_local_str = f_val(area_local);
 		std::string area_global_str = f_val(area_global);
 
+		// vibeic fork: for a row flagged always_print (the total "cells" row), a zero
+		// count must render as an explicit "0" rather than f_val()'s "-" dash, so that a
+		// const-prop-wiped / pure-permutation 0-cell module is machine-distinguishable
+		// from a stat block that emitted no cells row at all (matches <=0.4x behavior,
+		// which always printed "Number of cells: 0"). Only the count columns are forced;
+		// the area columns keep the dash.
+		if (always_print) {
+			if (count_local == 0)
+				count_local_str = "       0";
+			if (count_global == 0)
+				count_global_str = "       0";
+		}
+
 		if (print_area) {
 			if (print_hierarchical) {
 				log(" %s %s %s %s %s%s\n", count_global_str, area_global_str, count_local_str,
@@ -457,7 +471,7 @@ struct statdata_t {
 			} else if (print_global_only) {
 				log(" %s %s %s%s\n", count_global_str, area_global_str, indent, name);
 			} else {
-				if (count_local > 0)
+				if (count_local > 0 || always_print)
 					log(" %s %s %s%s\n", count_local_str, area_local_str, indent, name);
 			}
 		} else {
@@ -466,7 +480,7 @@ struct statdata_t {
 			} else if (print_global_only) {
 				log(" %s %s%s\n", count_global_str, indent, name);
 			} else {
-				if (count_local > 0)
+				if (count_local > 0 || always_print)
 					log(" %s %s%s\n", count_local_str, indent, name);
 			}
 		}
@@ -520,7 +534,10 @@ struct statdata_t {
 		print_log_line("memories", local_num_memories, 0, num_memories, 0, 0, print_area, print_hierarchical, print_global_only);
 		print_log_line("memory bits", local_num_memory_bits, 0, num_memory_bits, 0, 0, print_area, print_hierarchical, print_global_only);
 		print_log_line("processes", local_num_processes, 0, num_processes, 0, 0, print_area, print_hierarchical, print_global_only);
-		print_log_line("cells", local_num_cells, local_area, num_cells, area, 0, print_area, print_hierarchical, print_global_only);
+		// vibeic fork: always_print=true so the total "cells" row is emitted even when the
+		// module has 0 cells (const-prop-wiped / pure-permutation wiring module), keeping
+		// 0-cell modules distinguishable from a stat block that emitted no cells row.
+		print_log_line("cells", local_num_cells, local_area, num_cells, area, 0, print_area, print_hierarchical, print_global_only, true);
 		for (auto &it : num_cells_by_type)
 			if (it.second) {
 				auto name = string(it.first.unescape());
