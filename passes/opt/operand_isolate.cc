@@ -6,14 +6,21 @@
  *  behind DC minPower and Genus low-power datapath gating).
  *
  *  When a wide combinational datapath operator (a multiplier, adder, shifter,
- *  ...) feeds ONLY the data input of a clock-enabled register, its result is a
- *  don't-care on every cycle the enable is deasserted -- yet its operands keep
- *  toggling, so the whole operator switches (and glitches) every cycle for no
+ *  ...) drives a sink that only observes it under a one-bit condition, its
+ *  result is a don't-care whenever that condition is off -- yet its operands
+ *  keep toggling, so the whole operator switches (and glitches) for no
  *  observable effect. This pass AND-masks the operator's data operands with the
- *  register's (active-high) clock enable, so that whenever the register is not
- *  capturing, the operator sees constant-0 inputs and stops switching. When the
- *  register IS capturing the mask is transparent, so the captured value -- and
- *  therefore the register output -- is bit-identical.
+ *  observing condition, so that while the sink is not looking the operator sees
+ *  constant-0 inputs and stops switching; while it IS looking the mask is
+ *  transparent, so the observed value is bit-identical. Two sinks are handled:
+ *
+ *    - a clock-enabled register: the operator feeds the register data input and
+ *      the condition is the register's clock enable (result captured only while
+ *      enabled) -- sequential equivalence.
+ *    - a 2:1 mux: the operator feeds one data leg and the condition is the mux
+ *      select in the polarity that selects that leg (result observed only while
+ *      its leg is chosen), e.g. an ALU `sel ? op(a,b) : ...` -- combinational
+ *      equivalence.
  *
  *  Detection is the clock-gate enable-extraction pattern: iterate enabled FFs
  *  (any $dffe/$sdffe/$adffe/... -- read via FfData.has_ce), and for each one
@@ -70,7 +77,8 @@ struct OperandIsolateWorker
 
 	pool<SigBit> output_bits;   // bits that reach a module output port
 
-	struct Match { Cell *ff, *dp; SigBit ce; bool pol_ce; };
+	// dp = operator to gate; transparent when `ce` == (active_high ? 1 : 0).
+	struct Match { Cell *dp; SigBit ce; bool active_high; std::string sink; };
 
 	OperandIsolateWorker(Module *module, bool keep) :
 			module(module), sigmap(module),
@@ -117,35 +125,62 @@ struct OperandIsolateWorker
 		return true;
 	}
 
+	// An operator qualifies as an isolation target when its whole output is the
+	// private (single-sink, unobserved) driver of `sink_sig`.
+	Cell *isolatable_driver_of(const SigSpec &sink_sig)
+	{
+		SigSpec s = sigmap(sink_sig);
+		Cell *dp = sole_driver(s);
+		if (!dp || !isolatable_types().count(dp->type) || !dp->hasPort(ID::Y))
+			return nullptr;
+		if (sigmap(dp->getPort(ID::Y)) != s)   // sink must be exactly the whole result
+			return nullptr;
+		if (!is_private(dp->getPort(ID::Y)))   // result must not be observed elsewhere
+			return nullptr;
+		return dp;
+	}
+
 	void run()
 	{
 		// Phase 1: collect matches read-only (keeps modwalker's index valid).
 		std::vector<Match> matches;
 		for (auto cell : module->selected_cells()) {
-			if (!RTLIL::builtin_ff_cell_types().count(cell->type))
+			// Sink 1: a clock-enabled register -- gate the operator feeding its
+			// data input, transparent while the enable is active.
+			if (RTLIL::builtin_ff_cell_types().count(cell->type)) {
+				FfData ff(nullptr, cell);
+				if (!ff.has_ce)
+					continue;
+				if (GetSize(ff.sig_ce) != 1 || !ff.sig_ce[0].is_wire())
+					continue;
+				Cell *dp = isolatable_driver_of(ff.sig_d);
+				if (dp)
+					matches.push_back(Match{dp, ff.sig_ce[0], ff.pol_ce,
+							stringf("%s %s", log_id(cell->type), log_id(cell))});
 				continue;
-			FfData ff(nullptr, cell);
-			if (!ff.has_ce)
+			}
+			// Sink 2: a 2:1 mux -- gate the operator feeding a data leg,
+			// transparent only while that leg is selected (A leg: S==0, B leg:
+			// S==1). Isolates ALU-style `S ? op(a,b) : ...` datapaths.
+			if (cell->type == ID($mux)) {
+				SigSpec sel = cell->getPort(ID::S);
+				if (GetSize(sel) != 1 || !sigmap(sel)[0].is_wire())
+					continue;
+				SigBit s = sigmap(sel)[0];
+				if (Cell *dp = isolatable_driver_of(cell->getPort(ID::A)))
+					matches.push_back(Match{dp, s, /*active_high=*/false,
+							stringf("%s %s.A", log_id(cell->type), log_id(cell))});
+				if (Cell *dp = isolatable_driver_of(cell->getPort(ID::B)))
+					matches.push_back(Match{dp, s, /*active_high=*/true,
+							stringf("%s %s.B", log_id(cell->type), log_id(cell))});
 				continue;
-			if (GetSize(ff.sig_ce) != 1 || !ff.sig_ce[0].is_wire())
-				continue;
-
-			SigSpec d = sigmap(ff.sig_d);
-			Cell *dp = sole_driver(d);
-			if (!dp || !isolatable_types().count(dp->type) || !dp->hasPort(ID::Y))
-				continue;
-			if (sigmap(dp->getPort(ID::Y)) != d)   // D must be exactly the whole result
-				continue;
-			if (!is_private(dp->getPort(ID::Y)))   // result must not be observed elsewhere
-				continue;
-
-			matches.push_back(Match{cell, dp, ff.sig_ce[0], ff.pol_ce});
+			}
 		}
 
 		// Phase 2: apply the isolation.
 		for (auto &m : matches) {
 			SigBit en = m.ce;
-			if (!m.pol_ce) {                       // normalise to active-high
+			if (!m.active_high) {                  // normalise to active-high
 				Wire *inv = module->addWire(NEW_ID);
 				module->addNotGate(NEW_ID, m.ce, inv);
 				en = SigBit(inv);
@@ -172,9 +207,9 @@ struct OperandIsolateWorker
 			}
 			if (did) {
 				isolated++;
-				log("  isolated %s %s (enable %s) feeding %s %s\n",
+				log("  isolated %s %s (enable %s) feeding %s\n",
 						log_id(m.dp->type), log_id(m.dp),
-						log_signal(m.ce), log_id(m.ff->type), log_id(m.ff));
+						log_signal(m.ce), m.sink.c_str());
 			}
 		}
 	}
@@ -188,11 +223,13 @@ struct OperandIsolatePass : public Pass {
 		log("    operand_isolate [options] [selection]\n");
 		log("\n");
 		log("Insert operand-isolation (datapath-gating) AND masks: when a wide\n");
-		log("combinational operator ($mul/$add/$sub/$shl/... on ports A,B) drives ONLY\n");
-		log("the data input of a clock-enabled register, its A/B operands are AND-masked\n");
-		log("with the register's active-high clock enable, so the operator stops\n");
-		log("switching on every cycle the register is not capturing. The captured value\n");
-		log("is unchanged, so the transform is register-output equivalent.\n");
+		log("combinational operator ($mul/$add/$sub/$shl/... on ports A,B) drives ONLY a\n");
+		log("condition-observed sink, its A/B operands are AND-masked so the operator\n");
+		log("stops switching while the sink is not observing it, leaving the observed\n");
+		log("value unchanged. Two sinks are recognised:\n");
+		log("  - a clock-enabled register (gate = active-high clock enable), and\n");
+		log("  - a 2:1 mux data leg (gate = the select in the polarity choosing that\n");
+		log("    leg), e.g. an ALU 'sel ? op(a,b) : ...'.\n");
 		log("\n");
 		log("    -nokeep\n");
 		log("        do not mark the inserted mask cells (* keep *). By default the\n");
