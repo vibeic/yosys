@@ -437,6 +437,107 @@ static bool create_latch(RTLIL::Module *module, const LibertyAst *node, bool fla
 	return true;
 }
 
+// Model an integrated clock-gating cell (ICG).
+//
+// A Liberty ICG (e.g. sky130_fd_sc_hd__dlclkp / __sdlclkp) has no `function` on
+// its gated-clock output — the output is described by a `state_function` that
+// references an internal state node driven by a `statetable`. read_liberty cannot
+// interpret `statetable`/`state_function`, so functional import used to abort with
+// "Missing function on output ..." (or, with -ignore_miss_func, silently drop the
+// whole cell). Either way the cell has no SAT model, which makes gate-level LEC
+// unsound/incomplete on any clock-gated design.
+//
+// The ICG is identified structurally by the standard Liberty pin markers
+// (clock_gate_clock_pin / clock_gate_enable_pin / clock_gate_test_pin /
+// clock_gate_out_pin) and is modelled with the canonical, glitch-free latch-based
+// gate that every foundry ICG implements:
+//
+//     state = DLATCH transparent while the clock is inactive (D = enable | test)
+//     gated_clock = state_function(clock, state)   (from the Liberty file)
+//
+// Using the output pin's own `state_function` keeps the gate polarity general
+// (sky130's is "(CLK*M0)", i.e. an active-high AND gate). Returns the set of
+// output pin ids that were driven, so the caller skips re-parsing them.
+static pool<RTLIL::IdString> create_clock_gate(RTLIL::Module *module, const LibertyAst *cell)
+{
+	pool<RTLIL::IdString> driven;
+
+	const LibertyAst *clk_pin = nullptr, *enable_pin = nullptr, *test_pin = nullptr;
+	std::vector<const LibertyAst *> out_pins;
+
+	for (auto node : cell->children) {
+		if (node->id != "pin" || node->args.size() != 1)
+			continue;
+		if (node->find("clock_gate_clock_pin"))  clk_pin = node;
+		if (node->find("clock_gate_enable_pin")) enable_pin = node;
+		if (node->find("clock_gate_test_pin"))   test_pin = node;
+		if (node->find("clock_gate_out_pin"))    out_pins.push_back(node);
+	}
+
+	// Only handle a well-formed ICG: gated-clock output + clock + enable.
+	if (out_pins.empty() || clk_pin == nullptr || enable_pin == nullptr)
+		return driven;
+
+	RTLIL::Wire *clk_wire = module->wire(RTLIL::escape_id(clk_pin->args.at(0)));
+	RTLIL::Wire *en_wire  = module->wire(RTLIL::escape_id(enable_pin->args.at(0)));
+	if (clk_wire == nullptr || en_wire == nullptr)
+		return driven;
+	RTLIL::SigBit clk_bit(clk_wire);
+
+	// Enable that is latched: the functional enable, forced active in scan/test.
+	RTLIL::SigBit en_bit(en_wire);
+	if (test_pin != nullptr) {
+		RTLIL::Wire *test_wire = module->wire(RTLIL::escape_id(test_pin->args.at(0)));
+		if (test_wire != nullptr)
+			en_bit = module->OrGate(NEW_ID, en_bit, RTLIL::SigBit(test_wire));
+	}
+
+	// The internal state node (statetable output) is the latched enable. Drive the
+	// cell's internal pin directly if present so the output's state_function, which
+	// references it by name, parses; otherwise use a fresh wire.
+	RTLIL::SigBit state;
+	{
+		RTLIL::Wire *state_wire = nullptr;
+		for (auto node : cell->children) {
+			if (node->id != "pin" || node->args.size() != 1)
+				continue;
+			const LibertyAst *dir = node->find("direction");
+			if (dir != nullptr && dir->value == "internal") {
+				state_wire = module->wire(RTLIL::escape_id(node->args.at(0)));
+				break;
+			}
+		}
+		state = state_wire ? RTLIL::SigBit(state_wire) : RTLIL::SigBit(module->addWire(NEW_ID));
+	}
+
+	// Latch the enable while the clock is low so the gated clock cannot glitch:
+	// $_DLATCH_N_ is transparent when E (= the clock) is 0.
+	RTLIL::Cell *latch = module->addCell(NEW_ID, ID($_DLATCH_N_));
+	latch->setPort(ID::E, clk_bit);
+	latch->setPort(ID::D, en_bit);
+	latch->setPort(ID::Q, state);
+
+	for (auto out : out_pins) {
+		RTLIL::Wire *out_wire = module->wire(RTLIL::escape_id(out->args.at(0)));
+		if (out_wire == nullptr)
+			continue;
+
+		// sky130: state_function is "(CLK*M0)" — an active-high AND gate. Using the
+		// library's own expression keeps the gate polarity general.
+		const LibertyAst *sf = out->find("state_function");
+		RTLIL::SigSpec gated;
+		if (sf != nullptr)
+			gated = parse_func_expr(module, sf->value.c_str());
+		else
+			gated = module->AndGate(NEW_ID, clk_bit, state);
+
+		module->connect(RTLIL::SigSig(out_wire, gated));
+		driven.insert(RTLIL::escape_id(out->args.at(0)));
+	}
+
+	return driven;
+}
+
 void parse_type_map(std::map<std::string, std::tuple<int, int, bool>> &type_map, const LibertyAst *ast)
 {
 	for (auto type_node : ast->children)
@@ -623,6 +724,9 @@ struct LibertyFrontend : public Frontend {
 				module->attributes[attr] = 1;
 
 			bool simple_comb_cell = true, has_outputs = false;
+			// Output pins driven by an integrated clock-gating model (see below).
+			// Declared here so no `goto skip_cell` bypasses its initialization.
+			pool<RTLIL::IdString> clock_gate_outputs;
 
 			for (auto node : cell->children)
 			{
@@ -715,6 +819,13 @@ struct LibertyFrontend : public Frontend {
 				}
 			}
 
+			// Integrated clock-gating cells describe their gated-clock output with a
+			// state_function over an internal statetable node (no plain `function`).
+			// Model them here so functional import does not abort; the driven output
+			// pins are then skipped by the function-parsing loop below.
+			if (!flag_lib)
+				clock_gate_outputs = create_clock_gate(module, cell);
+
 			for (auto node : cell->children)
 			{
 				if (node->id == "pin" && node->args.size() == 1)
@@ -725,6 +836,11 @@ struct LibertyFrontend : public Frontend {
 						simple_comb_cell = false;
 
 					if (flag_lib && dir->value == "internal")
+						continue;
+
+					// Internal state nodes (e.g. an ICG's latched-enable node) are
+					// driven by the ff/latch/clock-gate logic, not by a pin function.
+					if (!flag_lib && dir->value == "internal")
 						continue;
 
 					RTLIL::Wire *wire = module->wires_.at(RTLIL::escape_id(node->args.at(0)));
@@ -755,6 +871,11 @@ struct LibertyFrontend : public Frontend {
 					const LibertyAst *func = node->find("function");
 					if (func == NULL)
 					{
+						// Gated-clock output already driven by the ICG model above.
+						if (clock_gate_outputs.count(RTLIL::escape_id(node->args.at(0)))) {
+							simple_comb_cell = false;
+							continue;
+						}
 						if (dir->value != "inout") { // allow inout with missing function, can be used for power pins
 							if (!flag_ignore_miss_func)
 							{

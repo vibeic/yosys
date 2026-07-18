@@ -31,10 +31,28 @@ def ys_tests():
     for ys in sorted(glob.glob("*.ys")):
         gen_tests_makefile.generate_ys_test(ys)
 
+def clock_gate_test():
+    # Integrated clock-gating (ICG) cell modelling: read_liberty must import a
+    # gated-clock output described by state_function/statetable (no plain
+    # `function`) as a latch-based clock gate rather than aborting. The positive
+    # check proves the imported model equals the behavioural golden gate; the
+    # negative check proves a wrong (unlatched) gate is reported non-equivalent.
+    equiv = ("rename test_icg icg_lib; read_verilog {vlog}; proc; "
+             "rename test_icg icg_vlog; async2sync; "
+             "equiv_make icg_lib icg_vlog equiv; equiv_induct equiv; "
+             "equiv_status -assert equiv")
+    pos = equiv.format(vlog="clock_gate_ref.v")
+    neg = equiv.format(vlog="clock_gate_bug.v")
+    gen_tests_makefile.generate_cmd_test("clock_gate", [
+        f'$(YOSYS) -qp "read_liberty clock_gate.liberty; {pos}"',
+        f'! $(YOSYS) -qp "read_liberty clock_gate.liberty; {neg}"',
+    ])
+
 def main():
     def callback():
         lib_tests()
         ys_tests()
+        clock_gate_test()
 
     gen_tests_makefile.generate_custom(callback)
 

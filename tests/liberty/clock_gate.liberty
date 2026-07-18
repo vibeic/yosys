@@ -1,0 +1,33 @@
+/* Minimal integrated clock-gating (ICG) cell, shaped like the sky130
+ * sky130_fd_sc_hd__dlclkp cell: the gated-clock output GCLK has no plain
+ * `function`, only a `state_function` over an internal statetable node M0.
+ * read_liberty must model this as a latch-based clock gate instead of aborting
+ * with "Missing function on output GCLK". Named .liberty (not .lib) so the
+ * generic lib_tests() glob does not also pick it up. */
+library (clock_gate) {
+  delay_model : table_lookup;
+  time_unit : "1ns";
+  cell (test_icg) {
+    pin (CLK) {
+      clock_gate_clock_pin : "true";
+      direction : "input";
+    }
+    pin (GATE) {
+      clock_gate_enable_pin : "true";
+      direction : "input";
+    }
+    pin (GCLK) {
+      clock_gate_out_pin : "true";
+      direction : "output";
+      state_function : "(CLK*M0)";
+    }
+    pin (M0) {
+      direction : "internal";
+    }
+    statetable ("CLK GATE","M0") {
+      table : "L L : - : L,\
+               L H : - : H,\
+               H - : - : N";
+    }
+  }
+}
