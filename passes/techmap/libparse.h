@@ -185,6 +185,10 @@ namespace Yosys
 	public:
 		std::shared_ptr<const LibertyAst> shared_ast;
 		const LibertyAst *ast = nullptr;
+		// Yosys consumers want string values unquoted; a caller that has to
+		// write liberty back out needs the original quoting preserved. Off
+		// by default, so every existing consumer sees what it always saw.
+		bool retain_quotes = false;
 
 		LibertyParser(std::istream &f) : f(f), line(1) {
 			shared_ast.reset(parse(true));
@@ -200,6 +204,17 @@ namespace Yosys
 		}
 
 #ifndef FILTERLIB
+		// Quote-preserving variant. Deliberately bypasses the AST cache: a
+		// quoted AST must never be handed to a consumer expecting unquoted.
+		struct RetainQuotes {};
+		LibertyParser(std::istream &f, RetainQuotes) : f(f), line(1) {
+			retain_quotes = true;
+			shared_ast.reset(parse(true));
+			ast = shared_ast.get();
+			if (!ast)
+				log_error("No entries found in liberty file.\n");
+		}
+
 		LibertyParser(std::istream &f, const std::string &fname) : f(f), line(1) {
 			shared_ast = LibertyAstCache::instance.cached_ast(fname);
 			if (!shared_ast) {
