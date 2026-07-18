@@ -149,6 +149,9 @@ struct AbcConfig
 	bool markgroups = false;
 	pool<std::string> enabled_gates;
 	bool cmos_cost = false;
+	// vibeic fork: opt-in standard-cell QoR recovery knobs (default off => stock behaviour).
+	int area_recover_rounds = 0;  // extra ABC exact-area (&nf -A n) rounds; 0 = disabled
+	bool sizing_recover = false;  // append post-map gate-sizing (buffer/upsize/dnsize)
 
 	bool is_yosys_abc() const {
 #ifdef ABCEXTERNAL
@@ -1088,6 +1091,29 @@ void AbcModuleState::prepare_module(RTLIL::Design *design, RTLIL::Module *module
 	else
 		run_abc.abc_script += config.fast_mode ? ABC_FAST_COMMAND_DFL : ABC_COMMAND_DFL;
 
+	// vibeic fork: opt-in standard-cell QoR recovery, applied to the built-in
+	// -liberty/-genlib recipe only (not -fast, not a user -script). Both operations
+	// are logic-preserving cell re-selections, so the mapped function is unchanged.
+	//   -area_recover : bump ABC's exact-area rounds on the &nf mapper. Recovers area
+	//                   at equal delay (stock uses the default 2 rounds).
+	//   -sizing       : append gate-sizing (buffer/upsize/dnsize) after &put so a -D
+	//                   delay target actually takes effect on the non -constr path --
+	//                   the default &nf mapper ignores -D there (the -constr/CTR recipe
+	//                   already sizes, so -sizing is skipped when -constr is given).
+	if (config.script_file.empty() && !config.fast_mode &&
+			(!config.liberty_files.empty() || !config.genlib_files.empty())) {
+		if (config.area_recover_rounds > 0) {
+			size_t pos = run_abc.abc_script.rfind("&nf");
+			if (pos != std::string::npos)
+				run_abc.abc_script.insert(pos + 3, stringf(" -A %d", config.area_recover_rounds));
+		}
+		if (config.sizing_recover && config.constr_file.empty()) {
+			size_t pos = run_abc.abc_script.rfind("&put");
+			if (pos != std::string::npos)
+				run_abc.abc_script.insert(pos + 4, "; buffer; upsize {D}; dnsize {D}");
+		}
+	}
+
 	if (config.script_file.empty() && !config.delay_target.empty())
 		for (size_t pos = run_abc.abc_script.find("dretime;"); pos != std::string::npos; pos = run_abc.abc_script.find("dretime;", pos+1))
 			run_abc.abc_script = run_abc.abc_script.substr(0, pos) + "dretime; retime -o {D};" + run_abc.abc_script.substr(pos+8);
@@ -1930,6 +1956,18 @@ struct AbcPass : public Pass {
 		log("        otherwise:\n");
 		log("%s\n", fold_abc_cmd(ABC_FAST_COMMAND_DFL));
 		log("\n");
+		log("    -area_recover\n");
+		log("        (vibeic) run additional ABC exact-area mapping rounds ('&nf -A') on the\n");
+		log("        built-in -liberty/-genlib recipe, recovering area at equal delay. Has no\n");
+		log("        effect with -fast, -script, -lut or -sop. Logic-preserving.\n");
+		log("\n");
+		log("    -sizing\n");
+		log("        (vibeic) append gate-sizing ('buffer; upsize; dnsize') after standard-cell\n");
+		log("        mapping so that a -D delay target actually takes effect on the non -constr\n");
+		log("        path (the default '&nf' mapper ignores -D there). Trades a little area for\n");
+		log("        lower delay. Skipped when -constr is given (that recipe already sizes) and\n");
+		log("        with -fast, -script, -lut or -sop. Logic-preserving.\n");
+		log("\n");
 		log("    -liberty <file>\n");
 		log("        generate netlists for the specified cell library (using the liberty\n");
 		log("        file format).\n");
@@ -2229,6 +2267,14 @@ struct AbcPass : public Pass {
 			}
 			if (arg == "-markgroups") {
 				config.markgroups = true;
+				continue;
+			}
+			if (arg == "-area_recover") {
+				config.area_recover_rounds = 8;
+				continue;
+			}
+			if (arg == "-sizing") {
+				config.sizing_recover = true;
 				continue;
 			}
 			if (arg == "-liberty_args" && argidx+1 < args.size()) {
