@@ -222,6 +222,17 @@ struct ClockgatePass : public Pass {
 		log("        Intended for DFT scan-enable pins.\n");
 		log("    -min_net_size <n>\n");
 		log("        Only transform sets of at least <n> eligible FFs.\n");
+		log("    -max_net_size <n>\n");
+		log("        Limit each ICG to at most <n> gated FFs. Larger sets are\n");
+		log("        split over several identical ICGs driving disjoint groups\n");
+		log("        of FFs, bounding the gated-clock fanout a downstream CTS\n");
+		log("        has to balance. Off (unlimited) by default.\n");
+		log("    -gate_srst\n");
+		log("        Also gate FFs whose synchronous reset takes priority over\n");
+		log("        their clock enable (the common 'if (rst) .. else if (en) ..'\n");
+		log("        idiom, i.e. $sdffe), which is otherwise left ungated. The\n");
+		log("        ICG enable becomes (CE | SRST) so the reset still reaches\n");
+		log("        the FF on the cycles it is asserted. Off by default.\n");
 		log("        \n");
 	}
 
@@ -234,8 +245,14 @@ struct ClockgatePass : public Pass {
 		SigBit ce_bit;
 		bool pol_clk;
 		bool pol_ce;
+		// Sync reset of an $sdffe (reset over enable) folded into the ICG
+		// enable as (CE | SRST). Only set under -gate_srst.
+		bool has_srst = false;
+		SigBit srst_bit = State::S0;
+		bool pol_srst = true;
 		[[nodiscard]] Hasher hash_into(Hasher h) const {
-			auto t = std::make_tuple(clk_bit, ce_bit, pol_clk, pol_ce);
+			auto t = std::make_tuple(clk_bit, ce_bit, pol_clk, pol_ce,
+						 has_srst, srst_bit, pol_srst);
 			h.eat(t);
 			return h;
 		}
@@ -243,7 +260,10 @@ struct ClockgatePass : public Pass {
 			return (clk_bit == other.clk_bit) &&
 			       (ce_bit == other.ce_bit) &&
 			       (pol_clk == other.pol_clk) &&
-			       (pol_ce == other.pol_ce);
+			       (pol_ce == other.pol_ce) &&
+			       (has_srst == other.has_srst) &&
+			       (srst_bit == other.srst_bit) &&
+			       (pol_srst == other.pol_srst);
 		}
 	};
 
@@ -258,6 +278,11 @@ struct ClockgatePass : public Pass {
 		SigBit clk = ff.sig_clk[0];
 		SigBit ce = ff.sig_ce[0];
 		ClkNetInfo info{clk, ce, ff.pol_clk, ff.pol_ce};
+		if (ff.has_srst && !ff.ce_over_srst) {
+			info.has_srst = true;
+			info.srst_bit = ff.sig_srst[0];
+			info.pol_srst = ff.pol_srst;
+		}
 		return info;
 	}
 
@@ -270,6 +295,8 @@ struct ClockgatePass : public Pass {
 		std::vector<std::string> liberty_files;
 		std::vector<std::string> dont_use_cells;
 		int min_net_size = 0;
+		int max_net_size = 0;
+		bool gate_srst = false;
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
@@ -301,6 +328,16 @@ struct ClockgatePass : public Pass {
 				min_net_size = atoi(args[++argidx].c_str());
 				continue;
 			}
+			if (args[argidx] == "-max_net_size" && argidx+1 < args.size()) {
+				max_net_size = atoi(args[++argidx].c_str());
+				if (max_net_size < 0)
+					log_cmd_error("-max_net_size must not be negative\n");
+				continue;
+			}
+			if (args[argidx] == "-gate_srst") {
+				gate_srst = true;
+				continue;
+			}
 			break;
 		}
 
@@ -327,8 +364,14 @@ struct ClockgatePass : public Pass {
 
 		pool<Cell*> ce_ffs;
 		dict<ClkNetInfo, GClkNetInfo> clk_nets;
+		// Deterministic per-group FF order (module->cells() order), only
+		// consulted when -max_net_size splits a group over several ICGs.
+		dict<ClkNetInfo, std::vector<Cell*>> group_ffs;
+		// FF -> gated clock of the ICG it was assigned to when splitting
+		dict<Cell*, Wire*> split_gclk;
 
 		int gated_flop_count = 0;
+		int icg_count = 0;
 		for (auto module : design->selected_unboxed_whole_modules()) {
 			for (auto cell : module->cells()) {
 				if (!cell->is_builtin_ff())
@@ -337,8 +380,16 @@ struct ClockgatePass : public Pass {
 				FfData ff(nullptr, cell);
 				// It would be odd to get constants, but we better handle it
 				if (ff.has_ce) {
-					if (ff.has_srst && !ff.ce_over_srst)
-						continue;
+					if (ff.has_srst && !ff.ce_over_srst) {
+						// The sync reset outranks the enable, so the FF
+						// still has to see a clock edge whenever the reset
+						// is asserted. Foldable into the ICG enable, but
+						// only on request.
+						if (!gate_srst)
+							continue;
+						if (!ff.sig_srst.is_bit() || !ff.sig_srst[0].is_wire())
+							continue;
+					}
 					if (!ff.sig_clk.is_bit() || !ff.sig_ce.is_bit())
 						continue;
 					if (!ff.sig_clk[0].is_wire() || !ff.sig_ce[0].is_wire())
@@ -351,6 +402,7 @@ struct ClockgatePass : public Pass {
 					if (it == clk_nets.end())
 						clk_nets[info] = GClkNetInfo();
 					clk_nets[info].net_size++;
+					group_ffs[info].push_back(cell);
 				}
 			}
 
@@ -371,18 +423,45 @@ struct ClockgatePass : public Pass {
 				if (!matching_icg_desc)
 					continue;
 
-				Cell* icg = module->addCell(NEW_ID, matching_icg_desc->name);
-				icg->setPort(matching_icg_desc->ce_pin, clk.ce_bit);
-				icg->setPort(matching_icg_desc->clk_in_pin, clk.clk_bit);
-				gclk.new_net = module->addWire(NEW_ID);
-				icg->setPort(matching_icg_desc->clk_out_pin, gclk.new_net);
-				// Tie low DFT ports like scan chain enable
-				for (auto port : matching_icg_desc->tie_lo_pins)
-					icg->setPort(port, Const(0, 1));
-				// Fix CE polarity if needed
-				if (!clk.pol_ce) {
-					SigBit ce_fixed_pol = module->NotGate(NEW_ID, clk.ce_bit);
-					icg->setPort(matching_icg_desc->ce_pin, ce_fixed_pol);
+				// One ICG unless -max_net_size caps the gated-clock fanout
+				int chunk = max_net_size > 0 ? max_net_size : gclk.net_size;
+				int n_icgs = max_net_size > 0
+					? (gclk.net_size + max_net_size - 1) / max_net_size : 1;
+				auto& members = group_ffs.at(clk);
+
+				for (int i = 0; i < n_icgs; i++) {
+					Cell* icg = module->addCell(NEW_ID, matching_icg_desc->name);
+					icg->setPort(matching_icg_desc->ce_pin, clk.ce_bit);
+					icg->setPort(matching_icg_desc->clk_in_pin, clk.clk_bit);
+					Wire* gclk_net = module->addWire(NEW_ID);
+					if (i == 0)
+						gclk.new_net = gclk_net;
+					icg->setPort(matching_icg_desc->clk_out_pin, gclk_net);
+					// Tie low DFT ports like scan chain enable
+					for (auto port : matching_icg_desc->tie_lo_pins)
+						icg->setPort(port, Const(0, 1));
+					// Fix CE polarity if needed
+					SigBit ce_fixed_pol = clk.ce_bit;
+					if (!clk.pol_ce) {
+						ce_fixed_pol = module->NotGate(NEW_ID, clk.ce_bit);
+						icg->setPort(matching_icg_desc->ce_pin, ce_fixed_pol);
+					}
+					// A sync reset that outranks the enable must not be
+					// gated away: enable the ICG on (CE | SRST).
+					if (clk.has_srst) {
+						SigBit srst_fixed_pol = clk.pol_srst
+							? clk.srst_bit
+							: module->NotGate(NEW_ID, clk.srst_bit);
+						SigBit ce_or_srst = module->OrGate(NEW_ID,
+							ce_fixed_pol, srst_fixed_pol);
+						icg->setPort(matching_icg_desc->ce_pin, ce_or_srst);
+					}
+					icg_count++;
+
+					if (n_icgs > 1)
+						for (int j = i * chunk;
+						     j < std::min<int>((i + 1) * chunk, GetSize(members)); j++)
+							split_gclk[members[j]] = gclk_net;
 				}
 			}
 
@@ -400,7 +479,9 @@ struct ClockgatePass : public Pass {
 				ff.has_ce = false;
 				// Construct the clock gate
 				// ICG = integrated clock gate, industry shorthand
-				ff.sig_clk = (*it).second.new_net;
+				auto split_it = split_gclk.find(cell);
+				ff.sig_clk = split_it != split_gclk.end()
+					? split_it->second : (*it).second.new_net;
 
 				// Rebuild the flop
 				(void)ff.emit();
@@ -409,9 +490,11 @@ struct ClockgatePass : public Pass {
 			}
 			ce_ffs.clear();
 			clk_nets.clear();
+			group_ffs.clear();
+			split_gclk.clear();
 		}
 
-		log("Converted %d FFs.\n", gated_flop_count);
+		log("Converted %d FFs into %d ICGs.\n", gated_flop_count, icg_count);
     }
 } ClockgatePass;
 
