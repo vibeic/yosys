@@ -1,0 +1,44 @@
+# read_activity: switching activity from VCD and SAIF onto RTLIL wires.
+#
+# read_activity.vcd and read_activity.saif describe the same 40ns run. The
+# hand count of real 0<->1 crossings is:
+#
+#   clk  0->1@10, 1->0@20, 0->1@30, 1->0@40                        = 4
+#   a    0->1@10, 1->0@30   (the repeated 1 at #20 is NOT a toggle) = 2
+#   bus  0000->0011 = 2, 0011->0011 = 0, 0011->0101 = 2            = 4
+#   y    0->1@10, 1->0@30                                           = 2
+#
+# A parser that counted value-change lines instead of transitions would say
+# a = 4, so these numbers are what separates the two.
+
+read_verilog <<EOT
+module top(input clk, input a, input [3:0] bus, output y);
+	assign y = a ^ bus[0];
+endmodule
+EOT
+hierarchy -top top
+proc
+design -save before
+
+read_activity -scope tb.top read_activity.vcd
+select -assert-count 1 w:clk a:toggle_count=4 %i
+select -assert-count 1 w:a   a:toggle_count=2 %i
+select -assert-count 1 w:bus a:toggle_count=4 %i
+select -assert-count 1 w:y   a:toggle_count=2 %i
+# clk is high for 20 of 40ns; bus holds 60 bit-ns at 1 out of 160
+select -assert-count 1 w:clk a:static_probability=0.5 %i
+select -assert-count 1 w:bus a:static_probability=0.375 %i
+
+# the same run expressed as SAIF has to land on the same numbers
+design -load before
+read_activity -scope tb.top read_activity.saif
+select -assert-count 1 w:clk a:toggle_count=4 %i
+select -assert-count 1 w:a   a:toggle_count=2 %i
+select -assert-count 1 w:bus a:toggle_count=4 %i
+select -assert-count 1 w:y   a:toggle_count=2 %i
+select -assert-count 1 w:bus a:static_probability=0.375 %i
+
+# format can be forced rather than guessed from the name
+design -load before
+read_activity -vcd -scope tb.top read_activity.vcd
+select -assert-count 1 w:bus a:toggle_count=4 %i

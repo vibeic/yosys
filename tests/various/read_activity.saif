@@ -1,0 +1,16 @@
+(SAIFILE
+(SAIFVERSION "2.0")
+(DIVIDER /)
+(TIMESCALE 1 ns)
+(DURATION 40)
+(INSTANCE tb
+  (INSTANCE top
+    (NET
+      (clk (T0 20) (T1 20) (TX 0) (TC 4))
+      (a   (T0 20) (T1 20) (TX 0) (TC 2))
+      (bus (T0 100) (T1 60) (TX 0) (TC 4))
+      (y   (T0 20) (T1 20) (TX 0) (TC 2))
+    )
+  )
+)
+)
