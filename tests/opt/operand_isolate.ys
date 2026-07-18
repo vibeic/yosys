@@ -1,0 +1,34 @@
+# vibeic fork: operand_isolate -- sequential-CEC self-check.
+# The datapath ($add) feeding the enabled register's data input is operand-
+# gated with the clock enable; the register output must stay equivalent.
+
+read_verilog <<EOT
+module dut(input clk, input en, input [7:0] a, b, output reg [8:0] acc);
+	always @(posedge clk) if (en) acc <= a + b;
+endmodule
+EOT
+hierarchy -top dut
+proc
+opt
+design -stash gold
+
+read_verilog <<EOT
+module dut(input clk, input en, input [7:0] a, b, output reg [8:0] acc);
+	always @(posedge clk) if (en) acc <= a + b;
+endmodule
+EOT
+hierarchy -top dut
+proc
+opt
+operand_isolate
+# the two operands (a, b) must each be AND-masked with the enable
+select -assert-count 2 t:$and
+design -stash gate
+
+design -reset
+design -copy-from gold -as gold A:top dut
+design -copy-from gate -as gate A:top dut
+equiv_make gold gate equiv
+hierarchy -top equiv
+equiv_induct equiv
+equiv_status -assert
