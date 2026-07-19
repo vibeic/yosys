@@ -79,6 +79,9 @@ yosys_pass(muxpack
 yosys_pass(opt_balance_tree
 	opt_balance_tree.cc
 )
+yosys_pass(operand_isolate
+	operand_isolate.cc
+)
 
 pmgen_command(peepopt
 	peepopt_shiftmul_right.pmg

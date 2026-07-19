@@ -1,0 +1,34 @@
+# vibeic fork: operand_isolate -- combinational-CEC self-check (mux sink).
+# Both operator legs of an ALU-style `sel ? a+b : a-b` are operand-gated with
+# the mux select (a+b with sel, a-b with ~sel); the mux output stays identical.
+
+read_verilog <<EOT
+module dut(input sel, input [7:0] a, b, output [8:0] y);
+	assign y = sel ? (a + b) : (a - b);
+endmodule
+EOT
+hierarchy -top dut
+proc
+opt
+design -stash gold
+
+read_verilog <<EOT
+module dut(input sel, input [7:0] a, b, output [8:0] y);
+	assign y = sel ? (a + b) : (a - b);
+endmodule
+EOT
+hierarchy -top dut
+proc
+opt
+operand_isolate
+# both operators gated: 2 operands each -> 4 AND masks
+select -assert-count 4 t:$and
+design -stash gate
+
+design -reset
+design -copy-from gold -as gold A:top dut
+design -copy-from gate -as gate A:top dut
+equiv_make gold gate equiv
+hierarchy -top equiv
+equiv_simple
+equiv_status -assert
