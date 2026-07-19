@@ -8,6 +8,9 @@ yosys_pass(exec
 yosys_pass(add
 	add.cc
 )
+yosys_pass(read_activity
+	read_activity.cc
+)
 yosys_pass(delete
 	delete.cc
 )

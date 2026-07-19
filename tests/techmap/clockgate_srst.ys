@@ -1,0 +1,145 @@
+# clockgate: -gate_srst (fold a reset-over-enable sync reset into the ICG
+# enable) and -max_net_size (bound the gated-clock fanout).
+
+read_verilog <<EOT
+module top(input clk, input rst, input en, input [7:0] d,
+           output reg [7:0] q0, output reg [7:0] q1, output reg [7:0] q2);
+	// sync reset outranks the enable -> $sdffe
+	always @(posedge clk) begin
+		if (rst) q0 <= 8'h00;
+		else if (en) q0 <= d;
+	end
+	always @(posedge clk) begin
+		if (rst) q1 <= 8'h00;
+		else if (en) q1 <= d + 8'd1;
+	end
+	always @(posedge clk) begin
+		if (rst) q2 <= 8'h00;
+		else if (en) q2 <= d + 8'd2;
+	end
+endmodule
+EOT
+proc
+opt
+hierarchy -top top
+design -save before
+
+#------------------------------------------------------------------------------
+
+# Without -gate_srst these FFs are left alone, as before
+clockgate -liberty clockgate.lib
+select -assert-count 0 t:\pos_small
+select -assert-count 3 t:$sdffe
+
+#------------------------------------------------------------------------------
+
+# With -gate_srst all three share one ICG enabled on (CE | SRST)
+design -load before
+clockgate -liberty clockgate.lib -gate_srst
+select -assert-count 1 t:\pos_small
+select -assert-count 1 t:$_OR_
+select -assert-count 0 t:$sdffe
+select -assert-count 3 t:$sdff
+
+#------------------------------------------------------------------------------
+
+# ...and it is equivalent to the ungated design
+design -reset
+read_liberty clockgate.lib
+design -save map
+
+design -load before
+read_liberty -lib clockgate.lib
+equiv_opt -map %map -multiclock -assert clockgate -liberty clockgate.lib -gate_srst
+
+#------------------------------------------------------------------------------
+
+# -max_net_size splits one oversized ICG into several
+design -reset
+read_verilog <<EOT
+module top(input clk, input en, input [15:0] d, output reg [15:0] q);
+	genvar i;
+	generate for (i = 0; i < 16; i = i + 1) begin : g
+		always @(posedge clk) if (en) q[i] <= d[i];
+	end endgenerate
+endmodule
+EOT
+proc
+opt
+hierarchy -top top
+design -save wide
+
+clockgate -liberty clockgate.lib
+select -assert-count 1 t:\pos_small
+
+design -load wide
+clockgate -liberty clockgate.lib -max_net_size 4
+select -assert-count 4 t:\pos_small
+
+design -load wide
+clockgate -liberty clockgate.lib -max_net_size 6
+select -assert-count 3 t:\pos_small
+
+# every FF still gets a gated clock, and the split is equivalent
+design -load wide
+read_liberty -lib clockgate.lib
+equiv_opt -map %map -multiclock -assert clockgate -liberty clockgate.lib -max_net_size 4
+
+#------------------------------------------------------------------------------
+
+# -share_hierarchy chains an ICG whose enable implies another group's
+design -reset
+read_verilog <<EOT
+module top(input clk, input a, input b, input c, input [7:0] d,
+           output reg [7:0] q1, output reg [7:0] q2, output reg [7:0] q3);
+	wire e1 = a & b;
+	wire e2 = a & b & c;
+	always @(posedge clk) if (e1) q1 <= d;
+	always @(posedge clk) if (e1) q3 <= d + 8'd1;
+	always @(posedge clk) if (e2) q2 <= d;
+endmodule
+EOT
+proc
+opt
+hierarchy -top top
+design -save nested
+
+read_liberty -lib clockgate.lib
+hierarchy -top top
+clockgate -liberty clockgate.lib -share_hierarchy
+select -assert-count 2 t:\pos_small
+# the inner ICG is now clocked from the outer one, not from \clk
+select -assert-count 1 w:\clk %co:+[CLK] t:\pos_small %i
+
+design -load nested
+read_liberty -lib clockgate.lib
+equiv_opt -map %map -multiclock -assert clockgate -liberty clockgate.lib -share_hierarchy
+
+#------------------------------------------------------------------------------
+
+# enables that do not imply each other are left alone
+design -reset
+read_verilog <<EOT
+module top(input clk, input a, input b, input c, input [7:0] d,
+           output reg [7:0] q1, output reg [7:0] q2, output reg [7:0] q3);
+	wire e1 = a;
+	wire e2 = b & c;
+	always @(posedge clk) if (e1) q1 <= d;
+	always @(posedge clk) if (e1) q3 <= d + 8'd1;
+	always @(posedge clk) if (e2) q2 <= d;
+endmodule
+EOT
+proc
+opt
+hierarchy -top top
+design -save unrelated
+
+read_liberty -lib clockgate.lib
+hierarchy -top top
+clockgate -liberty clockgate.lib -share_hierarchy
+select -assert-count 2 t:\pos_small
+select -assert-count 2 w:\clk %co:+[CLK] t:\pos_small %i
+
+design -load unrelated
+read_liberty -lib clockgate.lib
+equiv_opt -map %map -multiclock -assert clockgate -liberty clockgate.lib -share_hierarchy

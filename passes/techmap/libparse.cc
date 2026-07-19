@@ -475,6 +475,11 @@ int LibertyParser::lexer_inner(std::string &str)
 		// but yosys expects to get unquoted
 #ifdef FILTERLIB
 		str = "\"" + str + "\"";
+#else
+		// ...except when the caller is going to write liberty back out
+		// and has to reproduce the original quoting.
+		if (retain_quotes)
+			str = "\"" + str + "\"";
 #endif
 		f.consume(i + 1);
 		return 'v';

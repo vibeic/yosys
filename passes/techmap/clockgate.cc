@@ -222,6 +222,25 @@ struct ClockgatePass : public Pass {
 		log("        Intended for DFT scan-enable pins.\n");
 		log("    -min_net_size <n>\n");
 		log("        Only transform sets of at least <n> eligible FFs.\n");
+		log("    -max_net_size <n>\n");
+		log("        Limit each ICG to at most <n> gated FFs. Larger sets are\n");
+		log("        split over several identical ICGs driving disjoint groups\n");
+		log("        of FFs, bounding the gated-clock fanout a downstream CTS\n");
+		log("        has to balance. Off (unlimited) by default.\n");
+		log("    -share_hierarchy\n");
+		log("        Chain ICGs whose enables are nested: if one group's enable\n");
+		log("        is a conjunction that contains another group's enable as a\n");
+		log("        sub-term, the narrower group's ICG is clocked from the\n");
+		log("        wider group's gated clock instead of the root clock, so it\n");
+		log("        stops toggling whenever the outer enable is low. Only\n");
+		log("        applies to active-high enables not folded with a reset.\n");
+		log("        Off by default.\n");
+		log("    -gate_srst\n");
+		log("        Also gate FFs whose synchronous reset takes priority over\n");
+		log("        their clock enable (the common 'if (rst) .. else if (en) ..'\n");
+		log("        idiom, i.e. $sdffe), which is otherwise left ungated. The\n");
+		log("        ICG enable becomes (CE | SRST) so the reset still reaches\n");
+		log("        the FF on the cycles it is asserted. Off by default.\n");
 		log("        \n");
 	}
 
@@ -234,8 +253,14 @@ struct ClockgatePass : public Pass {
 		SigBit ce_bit;
 		bool pol_clk;
 		bool pol_ce;
+		// Sync reset of an $sdffe (reset over enable) folded into the ICG
+		// enable as (CE | SRST). Only set under -gate_srst.
+		bool has_srst = false;
+		SigBit srst_bit = State::S0;
+		bool pol_srst = true;
 		[[nodiscard]] Hasher hash_into(Hasher h) const {
-			auto t = std::make_tuple(clk_bit, ce_bit, pol_clk, pol_ce);
+			auto t = std::make_tuple(clk_bit, ce_bit, pol_clk, pol_ce,
+						 has_srst, srst_bit, pol_srst);
 			h.eat(t);
 			return h;
 		}
@@ -243,7 +268,10 @@ struct ClockgatePass : public Pass {
 			return (clk_bit == other.clk_bit) &&
 			       (ce_bit == other.ce_bit) &&
 			       (pol_clk == other.pol_clk) &&
-			       (pol_ce == other.pol_ce);
+			       (pol_ce == other.pol_ce) &&
+			       (has_srst == other.has_srst) &&
+			       (srst_bit == other.srst_bit) &&
+			       (pol_srst == other.pol_srst);
 		}
 	};
 
@@ -252,12 +280,42 @@ struct ClockgatePass : public Pass {
 		int net_size;
 		// After ICG generation, we have new gated CLK signals
 		Wire* new_net;
+		// Every ICG driving this group (>1 only under -max_net_size)
+		std::vector<Cell*> icgs;
 	};
+
+	// Leaves of the conjunction driving a one-bit enable, so that one
+	// enable can be recognised as implying another: if the leaf set of A
+	// is a subset of the leaf set of B then B is only ever true when A is.
+	void collect_and_leaves(SigBit bit, SigMap &sigmap,
+				const dict<SigBit, Cell*> &drivers,
+				pool<SigBit> &leaves, int depth = 0) {
+		bit = sigmap(bit);
+		auto it = depth < 32 ? drivers.find(bit) : drivers.end();
+		if (it != drivers.end()) {
+			Cell *c = it->second;
+			if (c->type.in(ID($_AND_), ID($and), ID($logic_and))) {
+				SigSpec a = c->getPort(ID::A);
+				SigSpec b = c->getPort(ID::B);
+				if (GetSize(a) == 1 && GetSize(b) == 1) {
+					collect_and_leaves(a[0], sigmap, drivers, leaves, depth + 1);
+					collect_and_leaves(b[0], sigmap, drivers, leaves, depth + 1);
+					return;
+				}
+			}
+		}
+		leaves.insert(bit);
+	}
 
 	ClkNetInfo clk_info_from_ff(FfData& ff) {
 		SigBit clk = ff.sig_clk[0];
 		SigBit ce = ff.sig_ce[0];
 		ClkNetInfo info{clk, ce, ff.pol_clk, ff.pol_ce};
+		if (ff.has_srst && !ff.ce_over_srst) {
+			info.has_srst = true;
+			info.srst_bit = ff.sig_srst[0];
+			info.pol_srst = ff.pol_srst;
+		}
 		return info;
 	}
 
@@ -270,6 +328,9 @@ struct ClockgatePass : public Pass {
 		std::vector<std::string> liberty_files;
 		std::vector<std::string> dont_use_cells;
 		int min_net_size = 0;
+		int max_net_size = 0;
+		bool gate_srst = false;
+		bool share_hierarchy = false;
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
@@ -301,6 +362,20 @@ struct ClockgatePass : public Pass {
 				min_net_size = atoi(args[++argidx].c_str());
 				continue;
 			}
+			if (args[argidx] == "-max_net_size" && argidx+1 < args.size()) {
+				max_net_size = atoi(args[++argidx].c_str());
+				if (max_net_size < 0)
+					log_cmd_error("-max_net_size must not be negative\n");
+				continue;
+			}
+			if (args[argidx] == "-gate_srst") {
+				gate_srst = true;
+				continue;
+			}
+			if (args[argidx] == "-share_hierarchy") {
+				share_hierarchy = true;
+				continue;
+			}
 			break;
 		}
 
@@ -327,8 +402,15 @@ struct ClockgatePass : public Pass {
 
 		pool<Cell*> ce_ffs;
 		dict<ClkNetInfo, GClkNetInfo> clk_nets;
+		// Deterministic per-group FF order (module->cells() order), only
+		// consulted when -max_net_size splits a group over several ICGs.
+		dict<ClkNetInfo, std::vector<Cell*>> group_ffs;
+		// FF -> gated clock of the ICG it was assigned to when splitting
+		dict<Cell*, Wire*> split_gclk;
 
 		int gated_flop_count = 0;
+		int icg_count = 0;
+		int chained_icg_count = 0;
 		for (auto module : design->selected_unboxed_whole_modules()) {
 			for (auto cell : module->cells()) {
 				if (!cell->is_builtin_ff())
@@ -337,8 +419,16 @@ struct ClockgatePass : public Pass {
 				FfData ff(nullptr, cell);
 				// It would be odd to get constants, but we better handle it
 				if (ff.has_ce) {
-					if (ff.has_srst && !ff.ce_over_srst)
-						continue;
+					if (ff.has_srst && !ff.ce_over_srst) {
+						// The sync reset outranks the enable, so the FF
+						// still has to see a clock edge whenever the reset
+						// is asserted. Foldable into the ICG enable, but
+						// only on request.
+						if (!gate_srst)
+							continue;
+						if (!ff.sig_srst.is_bit() || !ff.sig_srst[0].is_wire())
+							continue;
+					}
 					if (!ff.sig_clk.is_bit() || !ff.sig_ce.is_bit())
 						continue;
 					if (!ff.sig_clk[0].is_wire() || !ff.sig_ce[0].is_wire())
@@ -351,6 +441,7 @@ struct ClockgatePass : public Pass {
 					if (it == clk_nets.end())
 						clk_nets[info] = GClkNetInfo();
 					clk_nets[info].net_size++;
+					group_ffs[info].push_back(cell);
 				}
 			}
 
@@ -371,18 +462,116 @@ struct ClockgatePass : public Pass {
 				if (!matching_icg_desc)
 					continue;
 
-				Cell* icg = module->addCell(NEW_ID, matching_icg_desc->name);
-				icg->setPort(matching_icg_desc->ce_pin, clk.ce_bit);
-				icg->setPort(matching_icg_desc->clk_in_pin, clk.clk_bit);
-				gclk.new_net = module->addWire(NEW_ID);
-				icg->setPort(matching_icg_desc->clk_out_pin, gclk.new_net);
-				// Tie low DFT ports like scan chain enable
-				for (auto port : matching_icg_desc->tie_lo_pins)
-					icg->setPort(port, Const(0, 1));
-				// Fix CE polarity if needed
-				if (!clk.pol_ce) {
-					SigBit ce_fixed_pol = module->NotGate(NEW_ID, clk.ce_bit);
-					icg->setPort(matching_icg_desc->ce_pin, ce_fixed_pol);
+				// One ICG unless -max_net_size caps the gated-clock fanout
+				int chunk = max_net_size > 0 ? max_net_size : gclk.net_size;
+				int n_icgs = max_net_size > 0
+					? (gclk.net_size + max_net_size - 1) / max_net_size : 1;
+				auto& members = group_ffs.at(clk);
+
+				for (int i = 0; i < n_icgs; i++) {
+					Cell* icg = module->addCell(NEW_ID, matching_icg_desc->name);
+					icg->setPort(matching_icg_desc->ce_pin, clk.ce_bit);
+					icg->setPort(matching_icg_desc->clk_in_pin, clk.clk_bit);
+					Wire* gclk_net = module->addWire(NEW_ID);
+					if (i == 0)
+						gclk.new_net = gclk_net;
+					icg->setPort(matching_icg_desc->clk_out_pin, gclk_net);
+					// Tie low DFT ports like scan chain enable
+					for (auto port : matching_icg_desc->tie_lo_pins)
+						icg->setPort(port, Const(0, 1));
+					// Fix CE polarity if needed
+					SigBit ce_fixed_pol = clk.ce_bit;
+					if (!clk.pol_ce) {
+						ce_fixed_pol = module->NotGate(NEW_ID, clk.ce_bit);
+						icg->setPort(matching_icg_desc->ce_pin, ce_fixed_pol);
+					}
+					// A sync reset that outranks the enable must not be
+					// gated away: enable the ICG on (CE | SRST).
+					if (clk.has_srst) {
+						SigBit srst_fixed_pol = clk.pol_srst
+							? clk.srst_bit
+							: module->NotGate(NEW_ID, clk.srst_bit);
+						SigBit ce_or_srst = module->OrGate(NEW_ID,
+							ce_fixed_pol, srst_fixed_pol);
+						icg->setPort(matching_icg_desc->ce_pin, ce_or_srst);
+					}
+					icg_count++;
+					gclk.icgs.push_back(icg);
+
+					if (n_icgs > 1)
+						for (int j = i * chunk;
+						     j < std::min<int>((i + 1) * chunk, GetSize(members)); j++)
+							split_gclk[members[j]] = gclk_net;
+				}
+			}
+
+			// Re-parent nested ICGs. Done after every ICG exists so the
+			// order in which they were created is untouched.
+			if (share_hierarchy) {
+				SigMap sigmap(module);
+				dict<SigBit, Cell*> drivers;
+				for (auto cell : module->cells())
+					for (auto &conn : cell->connections())
+						if (cell->output(conn.first))
+							for (auto bit : sigmap(conn.second))
+								drivers[bit] = cell;
+
+				// Enables we can reason about: active high, no folded reset
+				std::vector<ClkNetInfo> cand;
+				dict<ClkNetInfo, pool<SigBit>> leaves;
+				for (auto& clk_net : clk_nets) {
+					auto& clk = clk_net.first;
+					if (!clk.pol_ce || clk.has_srst)
+						continue;
+					if (clk_net.second.icgs.empty())
+						continue;
+					pool<SigBit> l;
+					collect_and_leaves(clk.ce_bit, sigmap, drivers, l);
+					leaves[clk] = l;
+					cand.push_back(clk);
+				}
+
+				for (auto& child : cand) {
+					auto& child_leaves = leaves.at(child);
+					// Deepest strict subset wins: the tightest enable
+					// that is still implied by this one.
+					const ClkNetInfo *parent = nullptr;
+					size_t best = 0;
+					for (auto& other : cand) {
+						if (other == child)
+							continue;
+						if (other.clk_bit != child.clk_bit ||
+						    other.pol_clk != child.pol_clk)
+							continue;
+						auto& other_leaves = leaves.at(other);
+						if (other_leaves.size() >= child_leaves.size())
+							continue;
+						bool subset = true;
+						for (auto bit : other_leaves)
+							if (!child_leaves.count(bit)) {
+								subset = false;
+								break;
+							}
+						if (!subset)
+							continue;
+						if (other_leaves.size() > best) {
+							best = other_leaves.size();
+							parent = &other;
+						}
+					}
+					if (!parent)
+						continue;
+
+					// Subset is a strict partial order, so chaining
+					// along it cannot close a loop.
+					Wire *parent_gclk = clk_nets.at(*parent).new_net;
+					auto matching_icg_desc = child.pol_clk
+						? pos_icg_desc : neg_icg_desc;
+					for (auto icg : clk_nets.at(child).icgs)
+						icg->setPort(matching_icg_desc->clk_in_pin, parent_gclk);
+					log_debug("Chained ICG of enable %s onto %s\n",
+						log_signal(child.ce_bit), log_signal(parent->ce_bit));
+					chained_icg_count++;
 				}
 			}
 
@@ -400,7 +589,9 @@ struct ClockgatePass : public Pass {
 				ff.has_ce = false;
 				// Construct the clock gate
 				// ICG = integrated clock gate, industry shorthand
-				ff.sig_clk = (*it).second.new_net;
+				auto split_it = split_gclk.find(cell);
+				ff.sig_clk = split_it != split_gclk.end()
+					? split_it->second : (*it).second.new_net;
 
 				// Rebuild the flop
 				(void)ff.emit();
@@ -409,9 +600,13 @@ struct ClockgatePass : public Pass {
 			}
 			ce_ffs.clear();
 			clk_nets.clear();
+			group_ffs.clear();
+			split_gclk.clear();
 		}
 
-		log("Converted %d FFs.\n", gated_flop_count);
+		log("Converted %d FFs into %d ICGs.\n", gated_flop_count, icg_count);
+		if (chained_icg_count)
+			log("Chained %d ICGs onto an enclosing gated clock.\n", chained_icg_count);
     }
 } ClockgatePass;
 

@@ -215,6 +215,11 @@ yosys_pass(clockgate
 	REQUIRES
 		libparse
 )
+yosys_pass(merge_liberty
+	merge_liberty.cc
+	REQUIRES
+		libparse
+)
 yosys_pass(constmap
 	constmap.cc
 )
