@@ -98,10 +98,24 @@ struct KeepHierarchyPass : public Pass {
 		log("        towards the upper module's cost. This applies to both when the attribute\n");
 		log("        was added by this command or was pre-existing.\n");
 		log("\n");
+		log("    -max_instances <count>\n");
+		log("        (vibeic) also add the attribute to any module instantiated more than\n");
+		log("        <count> times across the whole design, regardless of its estimated size.\n");
+		log("        This is the 'keep replicated' half of a selective boundary optimization\n");
+		log("        (commercial 'ungroup -small' keeps replicated cells): a small module\n");
+		log("        used many times would otherwise be dissolved into every parent by a\n");
+		log("        following 'flatten', duplicating its logic N times and destroying the\n");
+		log("        single boundary that lets it be uniquified and mapped once. Combine with\n");
+		log("        -min_cost to keep both the large modules and the replicated ones and let\n");
+		log("        'flatten' dissolve only the small, single-use glue. Off unless given, so\n");
+		log("        the command is unchanged when it is not passed.\n");
+		log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
 		unsigned int min_cost = 0;
+		// -1 means "not given" (0 would mean "keep anything instantiated at all").
+		int64_t max_instances = -1;
 
 		log_header(design, "Executing KEEP_HIERARCHY pass.\n");
 
@@ -111,9 +125,43 @@ struct KeepHierarchyPass : public Pass {
 				min_cost = std::stoi(args[++argidx].c_str());
 				continue;
 			}
+			if (args[argidx] == "-max_instances" && argidx+1 < args.size()) {
+				max_instances = std::stoll(args[++argidx].c_str());
+				continue;
+			}
 			break;
 		}
 		extra_args(args, argidx, design);
+
+		bool did_selective = false;
+
+		// -max_instances runs first so replicated modules become boundaries before
+		// the -min_cost size accounting (which does not count gates inside a module
+		// that already carries keep_hierarchy).
+		if (max_instances >= 0) {
+			dict<RTLIL::Module *, int64_t> inst_count;
+			for (auto module : design->modules())
+				for (auto cell : module->cells()) {
+					if (!cell->type.isPublic())
+						continue;
+					RTLIL::Module *submodule = design->module(cell->type);
+					if (submodule)
+						inst_count[submodule]++;
+				}
+			for (auto &it : inst_count) {
+				RTLIL::Module *m = it.first;
+				if (it.second <= max_instances)
+					continue;
+				if (!design->selected_module(m->name))
+					continue;
+				if (m->get_blackbox_attribute() || m->has_attribute(ID::keep_hierarchy))
+					continue;
+				log("Keeping %s (instantiated %" PRId64 " times > %" PRId64 ").\n",
+						log_id(m), it.second, max_instances);
+				m->set_bool_attribute(ID::keep_hierarchy);
+			}
+			did_selective = true;
+		}
 
 		if (min_cost) {
 			RTLIL::Module *top = design->top_module();
@@ -122,7 +170,10 @@ struct KeepHierarchyPass : public Pass {
 
 			ThresholdHierarchyKeeping worker(design, min_cost);
 			worker.visit(top);
-		} else {
+			did_selective = true;
+		}
+
+		if (!did_selective) {
 			for (auto module : design->selected_modules()) {
 				log("Marking %s.\n", module);
 				module->set_bool_attribute(ID::keep_hierarchy);
