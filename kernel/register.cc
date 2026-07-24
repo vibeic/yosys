@@ -28,6 +28,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
+#include <unistd.h>
+#include <map>
 #include <filesystem>
 
 YOSYS_NAMESPACE_BEGIN
@@ -1197,6 +1199,111 @@ struct EchoPass : public Pass {
 
 SatSolver *yosys_satsolver_list;
 SatSolver *yosys_satsolver;
+
+// ─── vibeic fork: external CDCL SAT backend (kissat / cadical) ───────────────
+// The built-in ezMiniSAT (MiniSAT-2.2, 2008-era) times out on large SAT-based
+// ATPG miter CNFs — a 2-frame launch-off-capture transition-fault miter is
+// ~5.5e5 vars / ~1.4e6 clauses, and MiniSAT aborts (per-fault timeout) on hard
+// cones that a modern CDCL solver decides in seconds. Those aborts are counted
+// UNDETECTED, collapsing at-speed coverage; some of them are in fact provably
+// REDUNDANT (UNSAT), a verdict MiniSAT never reaches in time.
+//
+// This backend dumps the ezSAT CNF in DIMACS — byte-for-byte the same export as
+// `sat -dump_cnf`, i.e. printDIMACS() over getFullCnf(), which already contains
+// every clause AND every assume()'d constraint (assume() pushes directly into
+// cnfClauses). The external problem is therefore PROVABLY identical to the one
+// ezMiniSAT would solve, so the solver's SAT/UNSAT answer is exactly yosys's own
+// verdict: SAT => "model found: FAIL!" (fault detected) / UNSAT => "no model
+// found: SUCCESS!" (redundant). The model (used only for `sat -show`) is
+// reconstructed best-effort from the solver's `v` lines; the verdict never
+// depends on it. A timeout or an undecided result is a fail-safe ABORT (never a
+// false detection). Selected per-invocation with `sat -select-solver kissat`
+// (or `-select-solver cadical`), or globally via scratchpad key `sat.solver`.
+// chip/PDK-AGNOSTIC: pure CNF solving, no design knowledge.
+struct ExtCdclSat : public ezSAT {
+	std::string tool;   // binary + args, e.g. "kissat -q"
+	ExtCdclSat(const std::string &t) : tool(t) { }
+
+	bool solver(const std::vector<int> &modelExpressions,
+	            std::vector<bool> &modelValues,
+	            const std::vector<int> &assumptions) override
+	{
+		preSolverCallback();
+		solverTimeoutStatus = false;
+
+		// Pin every referenced literal into the dumped variable range, then
+		// export the full CNF (+ any solve-time assumptions as unit clauses).
+		std::vector<int> modelIdx;
+		for (int id : modelExpressions)
+			modelIdx.push_back(bind(id));
+		std::vector<std::vector<int>> extra;
+		for (int id : assumptions)
+			extra.push_back(std::vector<int>(1, bind(id)));
+
+		char cnfpath[] = "/tmp/yosys_extsat_XXXXXX";
+		int fd = mkstemp(cnfpath);
+		if (fd < 0) { solverTimeoutStatus = true; return false; }
+		FILE *cf = fdopen(fd, "w");
+		if (cf == NULL) { close(fd); unlink(cnfpath); solverTimeoutStatus = true; return false; }
+		printDIMACS(cf, false, extra);
+		fclose(cf);
+		std::string outpath = std::string(cnfpath) + ".out";
+
+		std::string cmd;
+		if (solverTimeout > 0)
+			cmd = stringf("timeout %d ", solverTimeout);
+		cmd += tool + " " + std::string(cnfpath) + " > " + outpath + " 2>/dev/null";
+		int syrc = system(cmd.c_str());
+		(void)syrc;
+
+		bool decided = false, sat = false;
+		std::map<int, bool> assign;
+		if (FILE *of = fopen(outpath.c_str(), "r")) {
+			char line[1 << 16];
+			while (fgets(line, sizeof(line), of)) {
+				if (line[0] == 's') {
+					if (strstr(line, "UNSATISFIABLE")) { sat = false; decided = true; }
+					else if (strstr(line, "SATISFIABLE")) { sat = true; decided = true; }
+				} else if (line[0] == 'v') {
+					char *p = line + 1, *end;
+					for (;;) {
+						long v = strtol(p, &end, 10);
+						if (end == p) break;
+						p = end;
+						if (v != 0) assign[abs((int)v)] = (v > 0);
+					}
+				}
+			}
+			fclose(of);
+		}
+		unlink(cnfpath);
+		unlink(outpath.c_str());
+
+		if (!decided) { solverTimeoutStatus = true; return false; }  // timeout/undecided => ABORT
+		if (!sat) return false;                                       // UNSAT => redundant
+
+		modelValues.clear();
+		modelValues.resize(modelIdx.size());
+		for (size_t i = 0; i < modelIdx.size(); i++) {
+			int idx = modelIdx[i];
+			std::map<int, bool>::iterator it = assign.find(abs(idx));
+			bool v = (it != assign.end()) ? it->second : false;
+			modelValues[i] = (idx > 0) ? v : !v;
+		}
+		return true;
+	}
+};
+
+struct KissatSatSolver : public SatSolver {
+	KissatSatSolver() : SatSolver("kissat") { }
+	ezSAT *create() override { return new ExtCdclSat("kissat -q"); }
+} KissatSatSolver;
+
+struct CadicalSatSolver : public SatSolver {
+	CadicalSatSolver() : SatSolver("cadical") { }
+	ezSAT *create() override { return new ExtCdclSat("cadical -q"); }
+} CadicalSatSolver;
+
 
 struct MinisatSatSolver : public SatSolver {
 	MinisatSatSolver() : SatSolver("minisat") {
