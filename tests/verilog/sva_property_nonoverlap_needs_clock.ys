@@ -1,0 +1,9 @@
+# `|=>' samples its antecedent one clock earlier, so an unclocked property using
+# it has no defined meaning. Diagnose that instead of silently proving something
+# else.
+logger -expect error "Non-overlapping implication .|=>. needs a clocking event" 1
+read_verilog -formal -sv <<EOT
+module top (input clk, input a, input b);
+	assert property (a |=> b);
+endmodule
+EOT

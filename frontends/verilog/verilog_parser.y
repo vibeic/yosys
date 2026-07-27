@@ -89,6 +89,27 @@
 			bool default_nettype_wire = true;
 			std::istream* lexin;
 
+			// Named SVA properties declared with `property <name>; ... endproperty`,
+			// keyed by the escaped identifier the lexer produces (e.g. "\\p_ab").
+			std::map<std::string, sva_property_ptr_t> sva_properties;
+			// Bare identifiers used as `assert property (<id>);` that did NOT name a
+			// property known at that point, with where they were used. If one of them
+			// turns out to be a property declared LATER in the same module, the use
+			// silently became an implicitly declared wire and the assertion would have
+			// proved nothing -- so it is reported instead.
+			std::map<std::string, Location> sva_pending_refs;
+			// Scratch flag: set by the `|=>` reduction, harvested by the property
+			// spec that encloses it. Property specs never nest, so one flag is enough.
+			bool sva_saw_nonoverlapping = false;
+
+			// Lower one SVA property (inline or named) into the current scope.
+			void emitSvaProperty(AST::AstNodeType type, const sva_property_spec &spec,
+					     const std::string *label, Location loc);
+			// If `expr` is a bare reference to a declared SVA property, emit that
+			// property and return true; otherwise leave `expr` alone and return false.
+			bool emitNamedSvaProperty(AST::AstNodeType type, const std::unique_ptr<AstNode> &expr,
+						  const std::string *label, Location loc);
+
 			AstNode* saveChild(std::unique_ptr<AstNode> child);
 			AstNode* pushChild(std::unique_ptr<AstNode> child);
 			void addWiretypeNode(std::string *name, AstNode* node);
@@ -250,6 +271,74 @@
 			auto* child_leaky = saveChild(std::move(child));
 			ast_stack.push_back(child_leaky);
 			return child_leaky;
+		}
+
+		// Lower one property of the supported SVA subset into the current scope.
+		//
+		// A clocked property becomes exactly the construct the AST back end already
+		// proves today:
+		//
+		//     always @(posedge clk) [label:] assert (<boolean>);
+		//
+		// so nothing downstream of the front end has to learn about SVA. An
+		// unclocked property stays an immediate assert/assume/cover/restrict.
+		void ParseState::emitSvaProperty(AST::AstNodeType type, const sva_property_spec &spec,
+						 const std::string *label, Location loc)
+		{
+			if (spec.nonoverlapping && spec.clk_event == nullptr)
+				err_at_loc(loc, "Non-overlapping implication `|=>' needs a clocking event: "
+						"write `assert property (@(posedge <clk>) a |=> b);' or declare "
+						"the clocking event in the named property.");
+
+			auto body = spec.body->clone();
+
+			if (spec.disable) {
+				// `disable iff (D)` kills every evaluation attempt that overlaps D.
+				// An overlapping implication is evaluated wholly in the current
+				// cycle, so D alone disables it. A non-overlapping one also spans
+				// the PREVIOUS cycle, so an attempt started while D was high must
+				// be disabled too -- hence the extra $past(D) term.
+				auto guard = spec.disable->clone();
+				if (spec.nonoverlapping) {
+					auto past_disable = std::make_unique<AstNode>(loc, AST_FCALL, spec.disable->clone());
+					past_disable->str = "\\$past";
+					guard = std::make_unique<AstNode>(loc, AST_LOGIC_OR, std::move(guard),
+									  std::move(past_disable));
+				}
+				body = std::make_unique<AstNode>(loc, AST_LOGIC_OR, std::move(guard), std::move(body));
+			}
+
+			if (spec.clk_event == nullptr) {
+				AstNode *node = saveChild(std::make_unique<AstNode>(loc, type, std::move(body)));
+				if (label != nullptr)
+					node->str = *label;
+				return;
+			}
+
+			auto stmt = std::make_unique<AstNode>(loc, type, std::move(body));
+			if (label != nullptr)
+				stmt->str = *label;
+			auto block = std::make_unique<AstNode>(loc, AST_BLOCK, std::move(stmt));
+			saveChild(std::make_unique<AstNode>(loc, AST_ALWAYS, spec.clk_event->clone(),
+							    std::move(block)));
+		}
+
+		// `assert property (<name>);` is syntactically indistinguishable from
+		// `assert property (<signal>);`, so the named-property case is resolved
+		// here rather than in the grammar: a bare identifier that names a declared
+		// property is expanded, anything else is left for the caller to emit.
+		bool ParseState::emitNamedSvaProperty(AST::AstNodeType type, const std::unique_ptr<AstNode> &expr,
+						      const std::string *label, Location loc)
+		{
+			if (expr == nullptr || expr->type != AST_IDENTIFIER || !expr->children.empty())
+				return false;
+			auto it = sva_properties.find(expr->str);
+			if (it == sva_properties.end()) {
+				sva_pending_refs.emplace(expr->str, loc);
+				return false;
+			}
+			emitSvaProperty(type, *it->second, label, loc);
+			return true;
 		}
 
 		void ParseState::addWiretypeNode(std::string *name, AstNode* node)
@@ -460,12 +549,31 @@
 		specify_triple fall;
 	};
 
+	// The pieces of the supported SVA property subset, kept apart until the
+	// enclosing assert/assume/cover/restrict statement is reduced. Holding them
+	// separately is what lets a NAMED property (`property p; ... endproperty`)
+	// be lowered exactly like the inline spelling at every one of its uses.
+	struct sva_property_spec {
+		// Clocking event: an AST_POSEDGE / AST_NEGEDGE node whose single child is
+		// the clock expression. nullptr => the property has no clocking event.
+		std::unique_ptr<YOSYS_NAMESPACE_PREFIX AST::AstNode> clk_event;
+		// `disable iff (<expr>)` guard. nullptr => no guard.
+		std::unique_ptr<YOSYS_NAMESPACE_PREFIX AST::AstNode> disable;
+		// The property body, already lowered to a plain boolean expression.
+		std::unique_ptr<YOSYS_NAMESPACE_PREFIX AST::AstNode> body;
+		// Set when the body used non-overlapping implication (`|=>`), which
+		// samples the antecedent one clock earlier and therefore REQUIRES a
+		// clocking event and a one-cycle-wider `disable iff` guard.
+		bool nonoverlapping = false;
+	};
+
 	using string_t = std::unique_ptr<std::string>;
 	using ast_t = std::unique_ptr<YOSYS_NAMESPACE_PREFIX AST::AstNode>;
 	using al_t = std::unique_ptr<YOSYS_NAMESPACE_PREFIX dict<YOSYS_NAMESPACE_PREFIX RTLIL::IdString, std::unique_ptr<YOSYS_NAMESPACE_PREFIX AST::AstNode>>>;
 	using specify_target_ptr_t = std::unique_ptr<struct specify_target>;
 	using specify_triple_ptr_t = std::unique_ptr<struct specify_triple>;
 	using specify_rise_fall_ptr_t = std::unique_ptr<struct specify_rise_fall>;
+	using sva_property_ptr_t = std::unique_ptr<struct sva_property_spec>;
 	using boolean_t = bool;
 	using ch_t = char;
 	using integer_t = int;
@@ -504,6 +612,12 @@
 %token TOK_SYNOPSYS_FULL_CASE TOK_SYNOPSYS_PARALLEL_CASE
 %token TOK_SUPPLY0 TOK_SUPPLY1 TOK_TO_SIGNED TOK_TO_UNSIGNED
 %token TOK_POS_INDEXED TOK_NEG_INDEXED TOK_PROPERTY TOK_ENUM TOK_TYPEDEF
+%token TOK_ENDPROPERTY TOK_SVA_DISABLE_IFF
+// SVA implication. These need no precedence: `expr` is already a complete
+// nonterminal, so `a && b |-> c || d` groups as `(a && b) |-> (c || d)` by
+// construction, and implications do not chain in the supported subset.
+%token OP_SVA_IMPLY "'|->'"
+%token OP_SVA_IMPLY_NEXT "'|=>'"
 %token TOK_RAND TOK_CONST TOK_CHECKER TOK_ENDCHECKER TOK_EVENTUALLY
 %token TOK_INCREMENT TOK_DECREMENT TOK_UNIQUE TOK_UNIQUE0 TOK_PRIORITY
 %token TOK_STRUCT TOK_PACKED TOK_UNSIGNED TOK_INT TOK_BYTE TOK_SHORTINT TOK_LONGINT TOK_VOID TOK_UNION
@@ -557,6 +671,9 @@
 %type <ast_t> struct_union
 %type <ast_node_type_t> asgn_binop inc_or_dec_op
 %type <ast_t> genvar_identifier
+%type <ast_t> sva_clocking_event sva_opt_clocking_event sva_disable_iff sva_opt_disable_iff
+%type <ast_t> sva_implication sva_prop_expr
+%type <sva_property_ptr_t> sva_property_spec sva_inline_property_spec
 
 %type <specify_target_ptr_t> specify_target
 %type <specify_triple_ptr_t> specify_triple specify_opt_triple
@@ -700,6 +817,10 @@ module:
 		extra->current_ast_mod = mod;
 		extra->port_stubs.clear();
 		extra->port_counter = 0;
+		// SVA property declarations are scoped to the module that declares them.
+		extra->sva_properties.clear();
+		extra->sva_pending_refs.clear();
+		extra->sva_saw_nonoverlapping = false;
 		mod->str = *$4;
 		append_attr(mod, std::move($1));
 	} module_para_opt module_args_opt TOK_SEMICOL module_body TOK_ENDMODULE opt_label {
@@ -1126,7 +1247,8 @@ module_body:
 module_body_stmt:
 	task_func_decl | specify_block | param_decl | localparam_decl | typedef_decl | defparam_decl | specparam_declaration | wire_decl | assign_stmt | cell_stmt |
 	enum_decl | struct_decl | bind_directive |
-	always_stmt | TOK_GENERATE module_gen_body TOK_ENDGENERATE | defattr | assert_property | checker_decl | ignored_specify_block;
+	always_stmt | TOK_GENERATE module_gen_body TOK_ENDGENERATE | defattr | assert_property | checker_decl | ignored_specify_block |
+	sva_property_decl;
 
 checker_decl:
 	TOK_CHECKER TOK_ID TOK_SEMICOL {
@@ -2584,6 +2706,47 @@ modport_type_token:
     TOK_INPUT {extra->current_modport_input = 1; extra->current_modport_output = 0;} | TOK_OUTPUT {extra->current_modport_input = 0; extra->current_modport_output = 1;}
 
 assert:
+	// `always @(posedge clk) assert (a |-> b);` -- an SVA implication written inside
+	// an IMMEDIATE assertion. IEEE 1800 does not allow this (an immediate assertion
+	// takes an expression, not a property expression), but the enclosing clocked
+	// block already supplies exactly the sampling semantics the implication needs,
+	// so it is accepted and lowered, with a warning naming the portable spelling.
+	opt_sva_label TOK_ASSERT opt_property TOK_LPAREN sva_implication TOK_RPAREN TOK_SEMICOL {
+		extra->sva_saw_nonoverlapping = false;
+		warn_at_loc(@5, "SVA implication inside an immediate `assert(...)' is not standard "
+				"SystemVerilog. It is accepted and lowered to the equivalent boolean; "
+				"the portable spelling is `assert property (@(posedge <clk>) a |-> b);'.");
+		if (mode->noassert) {
+		} else {
+			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, mode->assume_asserts ? AST_ASSUME : AST_ASSERT, std::move($5)));
+			SET_AST_NODE_LOC(node, ($1 != nullptr ? @1 : @2), @6);
+			if ($1 != nullptr)
+				node->str = *$1;
+		}
+	} |
+	opt_sva_label TOK_ASSUME opt_property TOK_LPAREN sva_implication TOK_RPAREN TOK_SEMICOL {
+		extra->sva_saw_nonoverlapping = false;
+		warn_at_loc(@5, "SVA implication inside an immediate `assume(...)' is not standard "
+				"SystemVerilog. It is accepted and lowered to the equivalent boolean; "
+				"the portable spelling is `assume property (@(posedge <clk>) a |-> b);'.");
+		if (mode->noassume) {
+		} else {
+			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, mode->assert_assumes ? AST_ASSERT : AST_ASSUME, std::move($5)));
+			SET_AST_NODE_LOC(node, ($1 != nullptr ? @1 : @2), @6);
+			if ($1 != nullptr)
+				node->str = *$1;
+		}
+	} |
+	opt_sva_label TOK_COVER opt_property TOK_LPAREN sva_implication TOK_RPAREN TOK_SEMICOL {
+		extra->sva_saw_nonoverlapping = false;
+		warn_at_loc(@5, "SVA implication inside an immediate `cover(...)' is not standard "
+				"SystemVerilog. It is accepted and lowered to the equivalent boolean; "
+				"the portable spelling is `cover property (@(posedge <clk>) a |-> b);'.");
+		AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_COVER, std::move($5)));
+		SET_AST_NODE_LOC(node, ($1 != nullptr ? @1 : @2), @6);
+		if ($1 != nullptr)
+			node->str = *$1;
+	} |
 	opt_sva_label TOK_ASSERT opt_property TOK_LPAREN expr TOK_RPAREN TOK_SEMICOL {
 		if (mode->noassert) {
 
@@ -2667,17 +2830,22 @@ assert:
 
 assert_property:
 	opt_sva_label TOK_ASSERT TOK_PROPERTY TOK_LPAREN expr TOK_RPAREN TOK_SEMICOL {
-		AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, mode->assume_asserts ? AST_ASSUME : AST_ASSERT, std::move($5)));
-		SET_AST_NODE_LOC(node, @1, @6);
-		if ($1 != nullptr) {
-			extra->ast_stack.back()->children.back()->str = *$1;
+		AstNodeType type = mode->assume_asserts ? AST_ASSUME : AST_ASSERT;
+		if (!extra->emitNamedSvaProperty(type, $5, $1.get(), @$)) {
+			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, type, std::move($5)));
+			SET_AST_NODE_LOC(node, @1, @6);
+			if ($1 != nullptr) {
+				extra->ast_stack.back()->children.back()->str = *$1;
+			}
 		}
 	} |
 	opt_sva_label TOK_ASSUME TOK_PROPERTY TOK_LPAREN expr TOK_RPAREN TOK_SEMICOL {
-		AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_ASSUME, std::move($5)));
-		SET_AST_NODE_LOC(node, @1, @6);
-		if ($1 != nullptr) {
-			extra->ast_stack.back()->children.back()->str = *$1;
+		if (!extra->emitNamedSvaProperty(AST_ASSUME, $5, $1.get(), @$)) {
+			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_ASSUME, std::move($5)));
+			SET_AST_NODE_LOC(node, @1, @6);
+			if ($1 != nullptr) {
+				extra->ast_stack.back()->children.back()->str = *$1;
+			}
 		}
 	} |
 	opt_sva_label TOK_ASSERT TOK_PROPERTY TOK_LPAREN TOK_EVENTUALLY expr TOK_RPAREN TOK_SEMICOL {
@@ -2695,15 +2863,17 @@ assert_property:
 		}
 	} |
 	opt_sva_label TOK_COVER TOK_PROPERTY TOK_LPAREN expr TOK_RPAREN TOK_SEMICOL {
-		AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_COVER, std::move($5)));
-		SET_AST_NODE_LOC(node, @1, @6);
-		if ($1 != nullptr) {
-			extra->ast_stack.back()->children.back()->str = *$1;
+		if (!extra->emitNamedSvaProperty(AST_COVER, $5, $1.get(), @$)) {
+			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_COVER, std::move($5)));
+			SET_AST_NODE_LOC(node, @1, @6);
+			if ($1 != nullptr) {
+				extra->ast_stack.back()->children.back()->str = *$1;
+			}
 		}
 	} |
 	opt_sva_label TOK_RESTRICT TOK_PROPERTY TOK_LPAREN expr TOK_RPAREN TOK_SEMICOL {
 		if (mode->norestrict) {
-		} else {
+		} else if (!extra->emitNamedSvaProperty(AST_ASSUME, $5, $1.get(), @$)) {
 			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_ASSUME, std::move($5)));
 			SET_AST_NODE_LOC(node, @1, @6);
 			if ($1 != nullptr) {
@@ -2720,6 +2890,156 @@ assert_property:
 				extra->ast_stack.back()->children.back()->str = *$1;
 			}
 		}
+	} |
+	// Inline property specs: `assert property (@(posedge clk) disable iff (r) a |-> b);`
+	// These are separate productions from the plain-`expr` ones above because an
+	// inline spec is recognisable from its first token (`@`, `disable iff`) or from
+	// carrying an implication operator.
+	opt_sva_label TOK_ASSERT TOK_PROPERTY TOK_LPAREN sva_inline_property_spec TOK_RPAREN TOK_SEMICOL {
+		extra->emitSvaProperty(mode->assume_asserts ? AST_ASSUME : AST_ASSERT, *$5, $1.get(), @$);
+	} |
+	opt_sva_label TOK_ASSUME TOK_PROPERTY TOK_LPAREN sva_inline_property_spec TOK_RPAREN TOK_SEMICOL {
+		extra->emitSvaProperty(AST_ASSUME, *$5, $1.get(), @$);
+	} |
+	opt_sva_label TOK_COVER TOK_PROPERTY TOK_LPAREN sva_inline_property_spec TOK_RPAREN TOK_SEMICOL {
+		extra->emitSvaProperty(AST_COVER, *$5, $1.get(), @$);
+	} |
+	opt_sva_label TOK_RESTRICT TOK_PROPERTY TOK_LPAREN sva_inline_property_spec TOK_RPAREN TOK_SEMICOL {
+		if (!mode->norestrict)
+			extra->emitSvaProperty(AST_ASSUME, *$5, $1.get(), @$);
+	};
+
+// ---------------------------------------------------------------------------
+// SystemVerilog assertions: the supported subset.
+//
+// Supported:   property <name>; [@(edge clk)] [disable iff (e)] <prop>; endproperty
+//              assert|assume|cover|restrict property (<name>);
+//              assert|assume|cover|restrict property (@(edge clk) [disable iff (e)] <prop>);
+//              <prop> ::= <boolean> | <boolean> |-> <boolean> | <boolean> |=> <boolean>
+// NOT supported (and diagnosed as such): sequences, `##` delays, repetition,
+//              `throughout`, `within`, property arguments, multi-clock properties.
+// ---------------------------------------------------------------------------
+
+sva_clocking_event:
+	TOK_AT TOK_LPAREN TOK_POSEDGE expr TOK_RPAREN {
+		$$ = std::make_unique<AstNode>(@$, AST_POSEDGE, std::move($4));
+		SET_AST_NODE_LOC($$.get(), @1, @5);
+	} |
+	TOK_AT TOK_LPAREN TOK_NEGEDGE expr TOK_RPAREN {
+		$$ = std::make_unique<AstNode>(@$, AST_NEGEDGE, std::move($4));
+		SET_AST_NODE_LOC($$.get(), @1, @5);
+	} |
+	TOK_AT TOK_LPAREN expr TOK_RPAREN {
+		err_at_loc(@3, "An SVA property needs an edge-triggered clocking event "
+			       "(`@(posedge <clk>)' or `@(negedge <clk>)'); level-sensitive "
+			       "clocking is not supported.");
+	};
+
+sva_opt_clocking_event:
+	sva_clocking_event {
+		$$ = std::move($1);
+	} |
+	%empty {
+		$$ = nullptr;
+	};
+
+sva_disable_iff:
+	TOK_SVA_DISABLE_IFF TOK_LPAREN expr TOK_RPAREN {
+		$$ = std::move($3);
+	};
+
+sva_opt_disable_iff:
+	sva_disable_iff {
+		$$ = std::move($1);
+	} |
+	%empty {
+		$$ = nullptr;
+	};
+
+sva_implication:
+	expr OP_SVA_IMPLY expr {
+		// `a |-> b` is checked in the same cycle, so it is exactly `!a || b`.
+		$$ = std::make_unique<AstNode>(@$, AST_LOGIC_OR,
+			std::make_unique<AstNode>(@1, AST_LOGIC_NOT, std::move($1)), std::move($3));
+		SET_AST_NODE_LOC($$.get(), @1, @3);
+	} |
+	expr OP_SVA_IMPLY_NEXT expr {
+		// `a |=> b` checks b one clock AFTER a, i.e. `!$past(a) || b`.
+		// $initstate excludes the very first cycle, where "one cycle ago" does not
+		// exist: the $past register's initial value is unconstrained in a formal
+		// flow, so without this term the solver could manufacture a counterexample
+		// out of a cycle the design never executes.
+		auto past = std::make_unique<AstNode>(@1, AST_FCALL, std::move($1));
+		past->str = "\\$past";
+		auto initstate = std::make_unique<AstNode>(@2, AST_FCALL);
+		initstate->str = "\\$initstate";
+		$$ = std::make_unique<AstNode>(@$, AST_LOGIC_OR, std::move(initstate),
+			std::make_unique<AstNode>(@$, AST_LOGIC_OR,
+				std::make_unique<AstNode>(@1, AST_LOGIC_NOT, std::move(past)),
+				std::move($3)));
+		SET_AST_NODE_LOC($$.get(), @1, @3);
+		extra->sva_saw_nonoverlapping = true;
+	};
+
+sva_prop_expr:
+	expr {
+		$$ = std::move($1);
+	} |
+	sva_implication {
+		$$ = std::move($1);
+	};
+
+sva_property_spec:
+	sva_opt_clocking_event sva_opt_disable_iff sva_prop_expr {
+		$$ = std::make_unique<sva_property_spec>();
+		$$->clk_event = std::move($1);
+		$$->disable = std::move($2);
+		$$->body = std::move($3);
+		$$->nonoverlapping = extra->sva_saw_nonoverlapping;
+		extra->sva_saw_nonoverlapping = false;
+	};
+
+sva_inline_property_spec:
+	sva_clocking_event sva_opt_disable_iff sva_prop_expr {
+		$$ = std::make_unique<sva_property_spec>();
+		$$->clk_event = std::move($1);
+		$$->disable = std::move($2);
+		$$->body = std::move($3);
+		$$->nonoverlapping = extra->sva_saw_nonoverlapping;
+		extra->sva_saw_nonoverlapping = false;
+	} |
+	sva_disable_iff sva_prop_expr {
+		$$ = std::make_unique<sva_property_spec>();
+		$$->disable = std::move($1);
+		$$->body = std::move($2);
+		$$->nonoverlapping = extra->sva_saw_nonoverlapping;
+		extra->sva_saw_nonoverlapping = false;
+	} |
+	sva_implication {
+		$$ = std::make_unique<sva_property_spec>();
+		$$->body = std::move($1);
+		$$->nonoverlapping = extra->sva_saw_nonoverlapping;
+		extra->sva_saw_nonoverlapping = false;
+	};
+
+sva_opt_semicol:
+	TOK_SEMICOL | %empty;
+
+sva_property_decl:
+	TOK_PROPERTY TOK_ID TOK_SEMICOL sva_property_spec sva_opt_semicol TOK_ENDPROPERTY opt_label {
+		if (extra->sva_properties.count(*$2))
+			err_at_loc(@2, "Redeclaration of SVA property `%s'.", $2->c_str() + 1);
+		// A use that came BEFORE this declaration did not see the property: it fell
+		// through to the ordinary expression path and became an implicitly declared
+		// wire, so the assertion would have proved nothing at all. Refuse it.
+		auto pending = extra->sva_pending_refs.find(*$2);
+		if (pending != extra->sva_pending_refs.end())
+			err_at_loc(pending->second, "SVA property `%s' is used before it is declared.",
+				   $2->c_str() + 1);
+		if ($7 != nullptr && *$7 != *$2)
+			err_at_loc(@7, "End label `%s' does not match SVA property `%s'.",
+				   $7->c_str() + 1, $2->c_str() + 1);
+		extra->sva_properties[*$2] = std::move($4);
 	};
 
 simple_behavioral_stmt:

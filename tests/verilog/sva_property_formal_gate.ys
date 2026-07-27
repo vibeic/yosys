@@ -1,0 +1,14 @@
+# The SVA keywords are behind the formal-mode gate: WITHOUT `-formal',
+# `endproperty' is still an ordinary identifier, exactly as before this feature
+# existed. (`property' itself has been an SV keyword since long before.)
+read_verilog -sv <<EOT
+module top (input clk, input a, output reg endproperty);
+	always @(posedge clk)
+		endproperty <= a;
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+select -assert-count 1 w:endproperty
+select -assert-count 0 t:$check
