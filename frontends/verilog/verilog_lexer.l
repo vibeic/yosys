@@ -81,6 +81,13 @@ YOSYS_NAMESPACE_END
 	string_t val = std::make_unique<std::string>(std::string("\\") + YYText()); \
 	return parser::make_TOK_ID(std::move(val), out_loc);
 
+/* YY_USER_ACTION has already advanced out_loc over the WHOLE match. After a
+   yyless() that pushes part of the match back, re-track the location as if only
+   the first `n` (newline-free) characters had been consumed -- otherwise every
+   pushed-back character is counted twice and the rest of the file reports wrong
+   columns (and, when the pushed-back text spans a newline, wrong line numbers). */
+#define RETRACK_LOC(n) do { out_loc.end = out_loc.begin; out_loc.columns(n); } while (0)
+
 
 #define YY_USER_ACTION \
 	out_loc.step(); \
@@ -417,6 +424,22 @@ TIME_SCALE_SUFFIX [munpf]?s
 "cover"      { if (mode->formal) return parser::make_TOK_COVER(out_loc); SV_KEYWORD(parser::make_TOK_COVER(out_loc)); }
 "restrict"   { if (mode->formal) return parser::make_TOK_RESTRICT(out_loc); SV_KEYWORD(parser::make_TOK_RESTRICT(out_loc)); }
 "property"   { if (mode->formal) return parser::make_TOK_PROPERTY(out_loc); SV_KEYWORD(parser::make_TOK_PROPERTY(out_loc)); }
+
+ /* `endproperty` closes a named SVA property declaration. It is only a keyword
+    in formal mode; everywhere else it keeps its previous meaning (an ordinary
+    identifier) so non-formal parsing is unaffected. */
+"endproperty" { if (mode->formal) return parser::make_TOK_ENDPROPERTY(out_loc); NON_KEYWORD(); }
+
+ /* `disable iff` is lexed as ONE token: `disable` on its own stays whatever it
+    is today (an identifier / the plain-Verilog block-disable keyword), so the
+    only construct affected is the SVA clocking-guard spelling. */
+"disable"[ \t\r\n]+"iff" {
+	if (mode->formal) return parser::make_TOK_SVA_DISABLE_IFF(out_loc);
+	yyless(7);
+	RETRACK_LOC(7);
+	NON_KEYWORD();
+}
+
 "rand"       { if (mode->formal) return parser::make_TOK_RAND(out_loc); SV_KEYWORD(parser::make_TOK_RAND(out_loc)); }
 "const"      { if (mode->formal) return parser::make_TOK_CONST(out_loc); SV_KEYWORD(parser::make_TOK_CONST(out_loc)); }
 "checker"    { if (mode->formal) return parser::make_TOK_CHECKER(out_loc); SV_KEYWORD(parser::make_TOK_CHECKER(out_loc)); }
@@ -661,6 +684,22 @@ import[ \t\r\n]+\"(DPI|DPI-C)\"[ \t\r\n]+function[ \t\r\n]+ {
 ">>>" { return parser::make_OP_SSHR(out_loc); }
 
 "'" { return parser::make_OP_CAST(out_loc); }
+
+ /* SVA implication / sequence-delay operators. Each is gated on formal mode and
+    pushes its match back otherwise, so outside `read_verilog -formal` the token
+    stream is byte-for-byte what it was before. */
+"|->" { if (mode->formal) return parser::make_OP_SVA_IMPLY(out_loc); yyless(1); RETRACK_LOC(1); return char_tok(*YYText(), out_loc); }
+"|=>" { if (mode->formal) return parser::make_OP_SVA_IMPLY_NEXT(out_loc); yyless(2); RETRACK_LOC(2); SV_KEYWORD(parser::make_TOK_BIT_OR_ASSIGN(out_loc)); }
+"##"  {
+	if (mode->formal)
+		err_at_loc(out_loc, "SystemVerilog sequence delay `##' is not supported. The "
+				    "Yosys Verilog frontend implements only the non-temporal SVA "
+				    "subset: an optional clocking event, an optional `disable iff', "
+				    "and `|->' / `|=>' over boolean expressions.");
+	yyless(1);
+	RETRACK_LOC(1);
+	return char_tok(*YYText(), out_loc);
+}
 
 "::"  { return parser::make_TOK_PACKAGESEP(out_loc); }
 "++"  { return parser::make_TOK_INCREMENT(out_loc); }

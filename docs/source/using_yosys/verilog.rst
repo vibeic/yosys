@@ -328,6 +328,65 @@ Non-standard or SystemVerilog features for formal verification
   ``@(posedge <netname>)`` or ``@(negedge <netname>)`` when ``<netname>`` is
   marked with the ``(* gclk *)`` Verilog attribute.
 
+.. _sva_subset:
+
+A subset of SystemVerilog Assertions
+------------------------------------
+
+With ``-formal``, `read_verilog` accepts a deliberately small, **non-temporal**
+subset of SystemVerilog Assertions. Everything in the subset is lowered to the
+plain clocked assertion the AST back end already understands, i.e.::
+
+    always @(posedge clk) <label>: assert (<boolean>);
+
+so no proof engine has to learn about SVA. Supported:
+
+- A named property declaration and its instantiation by name::
+
+      property p_ab;
+          @(posedge clk) disable iff (!rst_n) a |-> b;
+      endproperty
+      a_ab: assert property (p_ab);
+
+  ``assume``, ``cover`` and ``restrict`` take a named property the same way.
+
+- The same property spelled inline::
+
+      a_ab: assert property (@(posedge clk) disable iff (!rst_n) a |-> b);
+
+- Overlapping implication ``a |-> b`` (lowered to ``!a || b``) and
+  non-overlapping implication ``a |=> b`` (lowered to
+  ``$initstate || !$past(a) || b``; the ``$initstate`` term is what keeps the
+  free initial value of the ``$past`` register from manufacturing a
+  counterexample in the first cycle).
+
+- ``disable iff (D)`` guards the property with ``D`` -- and, for ``|=>``, also
+  with ``$past(D)``, because a non-overlapping attempt spans the previous cycle
+  and SVA kills any attempt that overlaps the disable condition.
+
+- As a Yosys extension, an implication may also be written inside an *immediate*
+  assertion in a clocked block (``always @(posedge clk) assert (a |-> b);``).
+  IEEE 1800 does not allow this, so it is accepted with a warning.
+
+A property must be declared before it is used. A use that comes first would
+otherwise fall through to the ordinary expression path, turn the property name
+into an implicitly declared wire, and leave an assertion that proves nothing --
+so that case is reported as an error rather than silently passing.
+
+Not supported. Three of these are diagnosed by name, so the message says what is
+missing instead of pointing at a token:
+
+- the sequence delay ``##N``,
+- a level-sensitive clocking event such as ``@(clk)``,
+- ``|=>`` on a property that has no clocking event.
+
+The rest still produce an ordinary syntax error: ``sequence`` ..
+``endsequence`` blocks, repetition (``[*n]``, ``[->n]``, ``[=n]``),
+``throughout``, ``within``, ``intersect``, properties with arguments,
+multi-clock properties, chained implications (``a |-> b |-> c``), and assertion
+action blocks (``assert property (...) else $error(...);``). For full SVA
+support use a front end that has it, such as the slang front end or Verific.
+
 
 Supported features from SystemVerilog
 -------------------------------------

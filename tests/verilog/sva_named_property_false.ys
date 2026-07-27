@@ -1,0 +1,37 @@
+# Falsifiability: the same named-property spelling as sva_named_property.ys, but
+# the implication is FALSE (`any' is high whenever ack is high, and ack can be
+# high while gnt is low). The proof MUST report the counterexample -- a property
+# that parses but can never fail would be worthless.
+logger -expect error "Called with -verify and proof did fail!" 1
+read_verilog -formal -sv <<EOT
+module dut (input clk, input rst_n, input req, output reg gnt, output reg ack, output any);
+	always @(posedge clk) begin
+		if (!rst_n) begin
+			gnt <= 1'b0;
+			ack <= 1'b0;
+		end else begin
+			gnt <= req;
+			ack <= gnt;
+		end
+	end
+	assign any = gnt | ack;
+endmodule
+
+module top (input clk);
+	(* anyseq *) wire rst_n;
+	(* anyseq *) wire req;
+	wire gnt, ack, any;
+	dut u (.clk(clk), .rst_n(rst_n), .req(req), .gnt(gnt), .ack(ack), .any(any));
+
+	property p_any_implies_gnt;
+		@(posedge clk) any |-> gnt;
+	endproperty
+	a_named_false: assert property (p_any_implies_gnt);
+endmodule
+EOT
+prep -top top
+flatten
+select -assert-count 1 t:$check
+async2sync
+chformal -lower
+sat -verify -prove-asserts -seq 10 -set-init-zero top
