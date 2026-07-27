@@ -1,0 +1,8 @@
+# `##' (sequence delay) is outside the supported subset and must say so plainly
+# rather than emitting a confusing token-level syntax error.
+logger -expect error "SystemVerilog sequence delay .##. is not supported" 1
+read_verilog -formal -sv <<EOT
+module top (input clk, input a, input b);
+	assert property (@(posedge clk) (a ##1 b) |-> b);
+endmodule
+EOT

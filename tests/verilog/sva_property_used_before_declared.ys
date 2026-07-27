@@ -1,0 +1,12 @@
+# A property used before it is declared does NOT resolve: the use falls through
+# to the ordinary expression path and `p_ab' becomes an implicitly declared wire,
+# so the assertion would prove nothing. That silent pass must be refused.
+logger -expect error "SVA property .p_ab. is used before it is declared" 1
+read_verilog -formal -sv <<EOT
+module top (input clk, input a, input b);
+	a_fwd: assert property (p_ab);
+	property p_ab;
+		@(posedge clk) a |-> b;
+	endproperty
+endmodule
+EOT

@@ -1,0 +1,53 @@
+# The supported SVA subset: a named property instantiated by name, an inline
+# clocking event carrying `disable iff` and `|=>`, and an implication written
+# inside an immediate assert in a clocked always block. All three lower to
+# clocked $assert cells, and all three are PROVED here, so "it parsed" can never
+# be mistaken for "it holds".
+read_verilog -formal -sv <<EOT
+module dut (input clk, input rst_n, input req, output reg gnt, output reg ack, output any);
+	always @(posedge clk) begin
+		if (!rst_n) begin
+			gnt <= 1'b0;
+			ack <= 1'b0;
+		end else begin
+			gnt <= req;
+			ack <= gnt;
+		end
+	end
+	assign any = gnt | ack;
+endmodule
+
+module top (input clk);
+	(* anyseq *) wire rst_n;
+	(* anyseq *) wire req;
+	wire gnt, ack, any;
+	dut u (.clk(clk), .rst_n(rst_n), .req(req), .gnt(gnt), .ack(ack), .any(any));
+
+	property p_gnt_implies_any;
+		@(posedge clk) gnt |-> any;
+	endproperty
+	a_named: assert property (p_gnt_implies_any);
+
+	a_inline: assert property (@(posedge clk) disable iff (!rst_n) gnt |=> ack);
+
+	always @(posedge clk) a_always: assert (gnt |-> any);
+endmodule
+EOT
+hierarchy -top top
+proc
+# The front end must have turned every one of the three spellings into its own
+# clocked assertion -- this is the parse/lowering check.
+select -assert-count 3 t:$check
+# ...and the assertions must then actually hold. `select -assert-count` is
+# repeated after prep so the proof below can never become vacuous by having had
+# every assertion optimised away.
+prep -top top
+flatten
+select -assert-count 3 t:$check
+# Every assertion is EDGE TRIGGERED -- async2sync refuses to lower a $check that
+# is not, so this doubles as proof that the lowering really did put each property
+# in a clocked process rather than emitting a combinational assert.
+async2sync
+chformal -lower
+select -assert-count 3 t:$assert
+sat -verify -prove-asserts -seq 10 -set-init-zero top
