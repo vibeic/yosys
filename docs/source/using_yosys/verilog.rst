@@ -406,6 +406,18 @@ otherwise fall through to the ordinary expression path, turn the property name
 into an implicitly declared wire, and leave an assertion that proves nothing --
 so that case is reported as an error rather than silently passing.
 
+That check is about ORDERING, and it is worth being exact about what it does not
+cover. A bare identifier that names no property anywhere -- a typo, or a property
+declared in a different module -- is not an SVA diagnostic at all: it takes the
+same implicit-wire path any undeclared identifier takes, and ``read_verilog``
+accepts it with the ordinary ``Identifier is implicitly declared`` warning. The
+resulting ``assert property (typo);`` proves whatever that free-floating wire
+happens to be, which in practice means it is trivially satisfied. Yosys has
+warned about implicit declarations since long before this subset existed, and
+promoting it to an error here would change behaviour far outside SVA -- but a
+reader should not take the paragraph above to mean that every unresolvable name
+is caught. Only a name that IS a property, used before its declaration, is.
+
 For the same reason, a named property may only be instantiated at **module
 scope**. Writing ``always @(posedge clk) assert property (p);`` is legal IEEE
 1800, but a named property is lowered at its point of use into an ``always``
