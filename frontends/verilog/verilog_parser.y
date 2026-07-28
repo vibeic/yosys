@@ -3032,7 +3032,7 @@ assert:
 assert_property:
 	opt_sva_label TOK_ASSERT TOK_PROPERTY TOK_LPAREN expr TOK_RPAREN TOK_SEMICOL {
 		AstNodeType type = mode->assume_asserts ? AST_ASSUME : AST_ASSERT;
-		if (!extra->emitNamedSvaProperty(type, $5, $1.get(), @$)) {
+		if (!extra->emitNamedSvaProperty(type, $5, $1.get(), @5)) {
 			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, type, std::move($5)));
 			SET_AST_NODE_LOC(node, @1, @6);
 			if ($1 != nullptr) {
@@ -3041,7 +3041,7 @@ assert_property:
 		}
 	} |
 	opt_sva_label TOK_ASSUME TOK_PROPERTY TOK_LPAREN expr TOK_RPAREN TOK_SEMICOL {
-		if (!extra->emitNamedSvaProperty(AST_ASSUME, $5, $1.get(), @$)) {
+		if (!extra->emitNamedSvaProperty(AST_ASSUME, $5, $1.get(), @5)) {
 			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_ASSUME, std::move($5)));
 			SET_AST_NODE_LOC(node, @1, @6);
 			if ($1 != nullptr) {
@@ -3066,7 +3066,7 @@ assert_property:
 		}
 	} |
 	opt_sva_label TOK_COVER TOK_PROPERTY TOK_LPAREN expr TOK_RPAREN TOK_SEMICOL {
-		if (!extra->emitNamedSvaProperty(AST_COVER, $5, $1.get(), @$)) {
+		if (!extra->emitNamedSvaProperty(AST_COVER, $5, $1.get(), @5)) {
 			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_COVER, std::move($5)));
 			SET_AST_NODE_LOC(node, @1, @6);
 			if ($1 != nullptr) {
@@ -3076,7 +3076,7 @@ assert_property:
 	} |
 	opt_sva_label TOK_RESTRICT TOK_PROPERTY TOK_LPAREN expr TOK_RPAREN TOK_SEMICOL {
 		if (mode->norestrict) {
-		} else if (!extra->emitNamedSvaProperty(AST_ASSUME, $5, $1.get(), @$)) {
+		} else if (!extra->emitNamedSvaProperty(AST_ASSUME, $5, $1.get(), @5)) {
 			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_ASSUME, std::move($5)));
 			SET_AST_NODE_LOC(node, @1, @6);
 			if ($1 != nullptr) {
@@ -3100,17 +3100,17 @@ assert_property:
 	// inline spec is recognisable from its first token (`@`, `disable iff`) or from
 	// carrying an implication operator.
 	opt_sva_label TOK_ASSERT TOK_PROPERTY TOK_LPAREN sva_inline_property_spec TOK_RPAREN TOK_SEMICOL {
-		extra->emitSvaProperty(mode->assume_asserts ? AST_ASSUME : AST_ASSERT, *$5, $1.get(), @$);
+		extra->emitSvaProperty(mode->assume_asserts ? AST_ASSUME : AST_ASSERT, *$5, $1.get(), @5);
 	} |
 	opt_sva_label TOK_ASSUME TOK_PROPERTY TOK_LPAREN sva_inline_property_spec TOK_RPAREN TOK_SEMICOL {
-		extra->emitSvaProperty(AST_ASSUME, *$5, $1.get(), @$);
+		extra->emitSvaProperty(AST_ASSUME, *$5, $1.get(), @5);
 	} |
 	opt_sva_label TOK_COVER TOK_PROPERTY TOK_LPAREN sva_inline_property_spec TOK_RPAREN TOK_SEMICOL {
-		extra->emitSvaProperty(AST_COVER, *$5, $1.get(), @$);
+		extra->emitSvaProperty(AST_COVER, *$5, $1.get(), @5);
 	} |
 	opt_sva_label TOK_RESTRICT TOK_PROPERTY TOK_LPAREN sva_inline_property_spec TOK_RPAREN TOK_SEMICOL {
 		if (!mode->norestrict)
-			extra->emitSvaProperty(AST_ASSUME, *$5, $1.get(), @$);
+			extra->emitSvaProperty(AST_ASSUME, *$5, $1.get(), @5);
 	};
 
 // ---------------------------------------------------------------------------
