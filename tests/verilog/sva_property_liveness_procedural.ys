@@ -1,0 +1,14 @@
+# The same silent mis-lowering inside a procedural block, through `assume'.
+# Module scope and procedural scope are both refused: a silent mis-lowering at
+# module scope is no better than one inside an `always' block, and covering only
+# one of them is how the first pass came to hook four productions out of seven.
+logger -expect error "SVA property .p_req_ack. cannot be used as the operand of .eventually" 1
+read_verilog -formal -sv <<EOT
+module top (input clk, input req);
+	wire ack = req;
+	property p_req_ack;
+		@(posedge clk) req |-> ack;
+	endproperty
+	always @(posedge clk) assume property (s_eventually p_req_ack);
+endmodule
+EOT

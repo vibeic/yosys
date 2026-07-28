@@ -120,6 +120,11 @@
 			// inside a procedural block, which would otherwise silently degrade to an
 			// implicitly declared wire.
 			void rejectProceduralSvaProperty(const std::unique_ptr<AstNode> &expr, Location loc);
+			// Refuse `assert|assume|restrict property (eventually <declared
+			// property>);` in EITHER scope. These productions take a bare `expr`
+			// and consult nothing, so the name silently became an implicitly
+			// declared wire and the liveness assertion checked an undriven net.
+			void rejectLivenessSvaProperty(const std::unique_ptr<AstNode> &expr, Location loc);
 
 			AstNode* saveChild(std::unique_ptr<AstNode> child);
 			AstNode* pushChild(std::unique_ptr<AstNode> child);
@@ -471,6 +476,40 @@
 			// which case this use also silently became a wire. Remember it so the
 			// declaration can refuse it rather than let it pass.
 			sva_procedural_refs.emplace(expr->str, loc);
+		}
+
+		// `assert property (s_eventually p);` — the SAME silent mis-lowering as the
+		// procedural case, on the six `TOK_EVENTUALLY expr` productions. They take a
+		// bare `expr` and consult nothing, so a name that IS a declared property
+		// became an implicitly declared, undriven wire: measured, the emitted design
+		// for `assert property (s_eventually p)` was a single `$check` with
+		// `FLAVOR "live"` over an undriven `\p`, byte-identical (modulo `\src`) to
+		// the same file with the `property ... endproperty` block DELETED. The
+		// declaration contributed nothing and the assertion could never fail.
+		//
+		// Refused rather than resolved, for the same reason the procedural spelling
+		// is: this subset lowers a named property into an `always` block of its own,
+		// carrying the property's own clocking event, and there is no sound way to
+		// place that under a liveness operator. Half-supporting the unclocked case
+		// would leave a partial surface behind.
+		//
+		// Applied in BOTH scopes. A silent mis-lowering at module scope is no better
+		// than one inside an `always` block, and leaving module scope alone is how
+		// the procedural fix came to cover four productions out of seven.
+		void ParseState::rejectLivenessSvaProperty(const std::unique_ptr<AstNode> &expr, Location loc)
+		{
+			if (expr == nullptr || expr->type != AST_IDENTIFIER || !expr->children.empty())
+				return;
+			if (sva_properties.count(expr->str))
+				err_at_loc(loc, "SVA property `%s' cannot be used as the operand of "
+						"`eventually'. This subset lowers a named property into an "
+						"`always' block of its own, which does not compose with a "
+						"liveness operator; write the property body inline instead.",
+					   expr->str.c_str() + 1);
+			// The name may be declared as a property LATER in this module, in which
+			// case this use also silently became a wire. Remember it so the
+			// declaration refuses it rather than letting it pass.
+			sva_pending_refs.emplace(expr->str, loc);
 		}
 
 		void ParseState::addWiretypeNode(std::string *name, AstNode* node)
@@ -1129,6 +1168,16 @@ interface:
 		extra->current_ast_mod = intf;
 		extra->port_stubs.clear();
 		extra->port_counter = 0;
+		// SVA property declarations are scoped to the module that declares them,
+		// and `interface_body_stmt` reaches `assert` through `always_stmt`. Without
+		// this reset a property declared in an EARLIER module leaks forward, and a
+		// legitimate `assert (p);` on an interface port that happens to share the
+		// name is turned into a hard error by rejectProceduralSvaProperty. The leak
+		// predates that function but was harmless while nothing in an interface
+		// consulted `sva_properties`; refusing procedural uses is what made it fire.
+		extra->sva_properties.clear();
+		extra->sva_pending_refs.clear();
+		extra->sva_procedural_refs.clear();
 		intf->str = *$3;
 	} module_para_opt module_args_opt TOK_SEMICOL interface_body TOK_ENDINTERFACE {
 		if (extra->port_stubs.size() != 0)
@@ -2914,6 +2963,7 @@ assert:
 		}
 	} |
 	opt_sva_label TOK_ASSERT opt_property TOK_LPAREN TOK_EVENTUALLY expr TOK_RPAREN TOK_SEMICOL {
+		extra->rejectLivenessSvaProperty($6, @6);
 		if (mode->noassert) {
 		} else {
 			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, mode->assume_asserts ? AST_FAIR : AST_LIVE, std::move($6)));
@@ -2923,6 +2973,7 @@ assert:
 		}
 	} |
 	opt_sva_label TOK_ASSUME opt_property TOK_LPAREN TOK_EVENTUALLY expr TOK_RPAREN TOK_SEMICOL {
+		extra->rejectLivenessSvaProperty($6, @6);
 		if (mode->noassume) {
 		} else {
 			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, mode->assert_assumes ? AST_LIVE : AST_FAIR, std::move($6)));
@@ -2966,6 +3017,7 @@ assert:
 			warn_at_loc(@3, "SystemVerilog does not allow \"restrict\" without \"property\".");
 	} |
 	opt_sva_label TOK_RESTRICT opt_property TOK_LPAREN TOK_EVENTUALLY expr TOK_RPAREN TOK_SEMICOL {
+		extra->rejectLivenessSvaProperty($6, @6);
 		if (mode->norestrict) {
 		} else {
 			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_FAIR, std::move($6)));
@@ -2998,6 +3050,7 @@ assert_property:
 		}
 	} |
 	opt_sva_label TOK_ASSERT TOK_PROPERTY TOK_LPAREN TOK_EVENTUALLY expr TOK_RPAREN TOK_SEMICOL {
+		extra->rejectLivenessSvaProperty($6, @6);
 		AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, mode->assume_asserts ? AST_FAIR : AST_LIVE, std::move($6)));
 		SET_AST_NODE_LOC(node, @1, @7);
 		if ($1 != nullptr) {
@@ -3005,6 +3058,7 @@ assert_property:
 		}
 	} |
 	opt_sva_label TOK_ASSUME TOK_PROPERTY TOK_LPAREN TOK_EVENTUALLY expr TOK_RPAREN TOK_SEMICOL {
+		extra->rejectLivenessSvaProperty($6, @6);
 		AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_FAIR, std::move($6)));
 		SET_AST_NODE_LOC(node, @1, @7);
 		if ($1 != nullptr) {
@@ -3031,6 +3085,7 @@ assert_property:
 		}
 	} |
 	opt_sva_label TOK_RESTRICT TOK_PROPERTY TOK_LPAREN TOK_EVENTUALLY expr TOK_RPAREN TOK_SEMICOL {
+		extra->rejectLivenessSvaProperty($6, @6);
 		if (mode->norestrict) {
 		} else {
 			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_FAIR, std::move($6)));

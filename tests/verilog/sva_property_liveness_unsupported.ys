@@ -1,0 +1,24 @@
+# `assert property (s_eventually <named property>);` used to be lowered SILENTLY
+# WRONG. The six `TOK_EVENTUALLY expr` productions took a bare expression and
+# consulted nothing, so a name that WAS a declared property became an implicitly
+# declared, undriven wire.
+#
+# Measured on the build before this fix: the emitted design for the module below
+# was a single `$check' cell with `FLAVOR "live"' whose `A' input was an undriven
+# `\p_req_ack', and `write_rtlil' output was identical -- apart from `\src' line
+# numbers -- to the same file with the `property ... endproperty' block DELETED.
+# The declaration contributed nothing and the assertion could never fail.
+#
+# Refused rather than resolved, for the same reason the procedural spelling is:
+# a named property is lowered into an `always' block carrying its own clocking
+# event, which does not compose with a liveness operator.
+logger -expect error "SVA property .p_req_ack. cannot be used as the operand of .eventually" 1
+read_verilog -formal -sv <<EOT
+module top (input clk, input req);
+	wire ack = req;
+	property p_req_ack;
+		@(posedge clk) req |-> ack;
+	endproperty
+	assert property (s_eventually p_req_ack);
+endmodule
+EOT

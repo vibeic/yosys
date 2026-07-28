@@ -1,0 +1,23 @@
+# SVA property declarations are scoped to the module that declares them, but the
+# `interface' rule did not reset the table the way `module' does. So a property
+# declared in any EARLIER module leaked forward, and because `interface_body_stmt`
+# reaches `assert` through `always_stmt`, a legitimate assertion on an interface
+# PORT that happened to share the name was turned into a hard error.
+#
+# Measured before this fix: this exact input was rc 1 with "SVA property `p'
+# cannot be instantiated inside a procedural block"; the same interface WITHOUT
+# the preceding module was rc 0. The leak was harmless until procedural uses
+# started being refused -- a false-clean traded for a false alarm.
+read_verilog -formal -sv <<EOT
+module owner (input clk, input a, input b);
+	property p;
+		@(posedge clk) a |-> b;
+	endproperty
+	assert property (p);
+endmodule
+interface I (input clk, input p);
+	always @(posedge clk) assert (p);
+	always @(posedge clk) assume (p);
+	always @(posedge clk) cover (p);
+endinterface
+EOT
