@@ -1,0 +1,26 @@
+# THE NEGATIVE CONTROL for the three tests above: it must pass on BOTH the
+# pre-fix and the post-fix build. `s_eventually' over an ordinary signal, and
+# over an expression, is legitimate and untouched -- the refusal is conditioned
+# on a bare identifier that resolves to a DECLARED property in the same module,
+# so a module that merely happens to contain a property declaration does not
+# lose the liveness spelling for everything else.
+#
+# Without this control the three refusals above would be satisfied by a blanket
+# rejection of `s_eventually', which would measure nothing.
+read_verilog -formal -sv <<EOT
+module top (input clk, input req, input ack);
+	property p_req_ack;
+		@(posedge clk) req |-> ack;
+	endproperty
+	assert property (s_eventually ack);
+	assume property (s_eventually (req && ack));
+	assert property (p_req_ack);
+endmodule
+EOT
+# Three concurrent assertions, and NO wire named after the property: the
+# named one was expanded rather than left as an undriven identifier. On the
+# pre-fix build the same file also passed, which is what makes this a
+# control rather than a measurement.
+select -assert-count 3 t:$check
+select -assert-count 0 w:p_req_ack
+select -assert-count 1 t:$logic_and

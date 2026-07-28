@@ -1,0 +1,13 @@
+# The use-before-declare hole on the liveness path. The use came first, saw no
+# property, and became a wire; the declaration below it has to refuse rather
+# than let the earlier assertion stand.
+logger -expect error "SVA property .p_req_ack. is used before it is declared" 1
+read_verilog -formal -sv <<EOT
+module top (input clk, input req);
+	wire ack = req;
+	assert property (s_eventually p_req_ack);
+	property p_req_ack;
+		@(posedge clk) req |-> ack;
+	endproperty
+endmodule
+EOT
