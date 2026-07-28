@@ -98,10 +98,17 @@
 			// silently became an implicitly declared wire and the assertion would have
 			// proved nothing -- so it is reported instead.
 			std::map<std::string, Location> sva_pending_refs;
-			// Scratch flag: set by the `|=>` reduction, harvested by the property
-			// spec that encloses it. Property specs never nest, so one flag is enough.
-			bool sva_saw_nonoverlapping = false;
+			// Bare identifiers used as `assert property (<id>);` inside a PROCEDURAL
+			// block, with where they were used. Concurrent assertions in procedural
+			// blocks are not supported (see rejectProceduralSvaProperty); one whose
+			// name turns out to be a property declared later is reported there.
+			std::map<std::string, Location> sva_procedural_refs;
 
+			// Build the boolean the back end checks for one SVA property. `cover`
+			// counts only non-vacuous matches, so it gets a different lowering from
+			// assert/assume/restrict.
+			std::unique_ptr<AstNode> buildSvaMatch(const sva_property_spec &spec, bool cover,
+							       Location loc);
 			// Lower one SVA property (inline or named) into the current scope.
 			void emitSvaProperty(AST::AstNodeType type, const sva_property_spec &spec,
 					     const std::string *label, Location loc);
@@ -109,6 +116,10 @@
 			// property and return true; otherwise leave `expr` alone and return false.
 			bool emitNamedSvaProperty(AST::AstNodeType type, const std::unique_ptr<AstNode> &expr,
 						  const std::string *label, Location loc);
+			// Refuse `assert|assume|cover property (<declared property>);` written
+			// inside a procedural block, which would otherwise silently degrade to an
+			// implicitly declared wire.
+			void rejectProceduralSvaProperty(const std::unique_ptr<AstNode> &expr, Location loc);
 
 			AstNode* saveChild(std::unique_ptr<AstNode> child);
 			AstNode* pushChild(std::unique_ptr<AstNode> child);
@@ -167,6 +178,14 @@
 	#define SET_RULE_LOC(LHS, BEGIN, END) \
 		do { (LHS).begin = BEGIN.begin; \
 		(LHS).end = (END).end; } while(0)
+
+	// The SVA subset is a `read_verilog -formal' feature. Grammar productions that
+	// are spelled entirely with pre-existing tokens must say so themselves, so that
+	// a plain `read_verilog -sv' read keeps rejecting them.
+	#define SVA_REQUIRE_FORMAL(LOC) \
+		do { if (!mode->formal) \
+			err_at_loc(LOC, "SystemVerilog assertion properties are only accepted " \
+					"with `read_verilog -formal'."); } while (0)
 
 	YOSYS_NAMESPACE_BEGIN
 	namespace VERILOG_FRONTEND {
@@ -273,6 +292,101 @@
 			return child_leaky;
 		}
 
+		// Build the boolean that the back end checks for one SVA property.
+		//
+		// assert/assume/restrict ask "does the property HOLD?". An implication whose
+		// antecedent never fires holds VACUOUSLY, so their lowering is the
+		// implication itself:
+		//
+		//     a |-> b   =>   !a || b
+		//     a |=> b   =>   $initstate || !$past(a) || b
+		//
+		// cover asks a different question: "did this scenario actually HAPPEN?".
+		// IEEE 1800-2017 clause 16.12.9 counts only NON-VACUOUS matches for a cover
+		// of an implication -- an attempt whose antecedent never fired is not a
+		// match at all. Lowering cover to the implication would report a property as
+		// covered in a run that never exercised it, i.e. a coverage report that
+		// lies, so cover gets the CONJUNCTION instead:
+		//
+		//     a |-> b   =>   a && b
+		//     a |=> b   =>   !$initstate && $past(a) && b
+		//
+		// A property with no implication has nothing to be vacuous about: it matches
+		// exactly when it is true, so both lowerings are the body itself.
+		std::unique_ptr<AstNode> ParseState::buildSvaMatch(const sva_property_spec &spec, bool cover,
+								  Location loc)
+		{
+			std::unique_ptr<AstNode> match;
+
+			if (spec.antecedent == nullptr) {
+				match = spec.body->clone();
+			} else {
+				Location span = location_range(spec.ant_loc, spec.body_loc);
+
+				// The sampled antecedent: `a` for `|->`, `$past(a)` for `|=>`.
+				auto ant = spec.antecedent->clone();
+				if (spec.nonoverlapping) {
+					auto past = std::make_unique<AstNode>(spec.ant_loc, AST_FCALL, std::move(ant));
+					past->str = "\\$past";
+					ant = std::move(past);
+				}
+
+				if (cover)
+					match = std::make_unique<AstNode>(span, AST_LOGIC_AND, std::move(ant),
+									  spec.body->clone());
+				else
+					match = std::make_unique<AstNode>(span, AST_LOGIC_OR,
+						std::make_unique<AstNode>(spec.ant_loc, AST_LOGIC_NOT, std::move(ant)),
+						spec.body->clone());
+
+				if (spec.nonoverlapping) {
+					// In the very first cycle "one cycle ago" does not exist and
+					// the $past register's initial value is unconstrained in a
+					// formal flow. No attempt can have STARTED there, so assert
+					// holds vacuously and cover must not count it.
+					auto initstate = std::make_unique<AstNode>(spec.op_loc, AST_FCALL);
+					initstate->str = "\\$initstate";
+					if (cover)
+						match = std::make_unique<AstNode>(span, AST_LOGIC_AND,
+							std::make_unique<AstNode>(spec.op_loc, AST_LOGIC_NOT,
+										  std::move(initstate)),
+							std::move(match));
+					else
+						match = std::make_unique<AstNode>(span, AST_LOGIC_OR,
+							std::move(initstate), std::move(match));
+				}
+				match->location = span;
+			}
+
+			if (spec.disable) {
+				// `disable iff (D)` kills every evaluation attempt that overlaps D.
+				// An overlapping implication is evaluated wholly in the current
+				// cycle, so D alone disables it. A non-overlapping one also spans
+				// the PREVIOUS cycle, so an attempt started while D was high must
+				// be disabled too -- hence the extra $past(D) term.
+				//
+				// A disabled attempt yields NEITHER a failure NOR a match: assert
+				// passes over it (guard || match), cover must not count it
+				// (!guard && match).
+				auto guard = spec.disable->clone();
+				if (spec.nonoverlapping) {
+					auto past_disable = std::make_unique<AstNode>(loc, AST_FCALL, spec.disable->clone());
+					past_disable->str = "\\$past";
+					guard = std::make_unique<AstNode>(loc, AST_LOGIC_OR, std::move(guard),
+									  std::move(past_disable));
+				}
+				if (cover)
+					match = std::make_unique<AstNode>(loc, AST_LOGIC_AND,
+						std::make_unique<AstNode>(loc, AST_LOGIC_NOT, std::move(guard)),
+						std::move(match));
+				else
+					match = std::make_unique<AstNode>(loc, AST_LOGIC_OR, std::move(guard),
+									  std::move(match));
+			}
+
+			return match;
+		}
+
 		// Lower one property of the supported SVA subset into the current scope.
 		//
 		// A clocked property becomes exactly the construct the AST back end already
@@ -290,23 +404,7 @@
 						"write `assert property (@(posedge <clk>) a |=> b);' or declare "
 						"the clocking event in the named property.");
 
-			auto body = spec.body->clone();
-
-			if (spec.disable) {
-				// `disable iff (D)` kills every evaluation attempt that overlaps D.
-				// An overlapping implication is evaluated wholly in the current
-				// cycle, so D alone disables it. A non-overlapping one also spans
-				// the PREVIOUS cycle, so an attempt started while D was high must
-				// be disabled too -- hence the extra $past(D) term.
-				auto guard = spec.disable->clone();
-				if (spec.nonoverlapping) {
-					auto past_disable = std::make_unique<AstNode>(loc, AST_FCALL, spec.disable->clone());
-					past_disable->str = "\\$past";
-					guard = std::make_unique<AstNode>(loc, AST_LOGIC_OR, std::move(guard),
-									  std::move(past_disable));
-				}
-				body = std::make_unique<AstNode>(loc, AST_LOGIC_OR, std::move(guard), std::move(body));
-			}
+			auto body = buildSvaMatch(spec, type == AST_COVER, loc);
 
 			if (spec.clk_event == nullptr) {
 				AstNode *node = saveChild(std::make_unique<AstNode>(loc, type, std::move(body)));
@@ -339,6 +437,40 @@
 			}
 			emitSvaProperty(type, *it->second, label, loc);
 			return true;
+		}
+
+		// `always @(posedge clk) assert property (p);` is a concurrent assertion
+		// written inside a procedural block. It is legal IEEE 1800, but this front
+		// end lowers a named property AT ITS POINT OF USE into an `always` block of
+		// its own, and it has no way to reconcile the property's own clocking event
+		// (or the absence of one) with the enclosing procedural block. So the
+		// spelling is not supported.
+		//
+		// Left alone it is far worse than unsupported: nothing looks `p` up, so the
+		// name silently becomes an implicitly declared, undriven wire and the tool
+		// proves something other than what was written -- a false alarm for assert,
+		// a fake green for cover, a silently dropped constraint for assume. Refuse
+		// it with a message that names the supported spelling instead.
+		//
+		// The `property` keyword is NOT required to trigger this. `assert (p);` with
+		// a property name is just as silently wrong, and a name that is both a wire
+		// and a property in one module is illegal SystemVerilog anyway -- so any
+		// bare identifier that resolves to a declared property is refused here.
+		// Identifiers that name no property are untouched: an ordinary
+		// `assert (ready);` behaves exactly as it always has.
+		void ParseState::rejectProceduralSvaProperty(const std::unique_ptr<AstNode> &expr, Location loc)
+		{
+			if (expr == nullptr || expr->type != AST_IDENTIFIER || !expr->children.empty())
+				return;
+			if (sva_properties.count(expr->str))
+				err_at_loc(loc, "SVA property `%s' cannot be instantiated inside a procedural "
+						"block. Move `assert property (%s);' out to module scope; the "
+						"property may carry its own `@(posedge <clk>)' clocking event.",
+					   expr->str.c_str() + 1, expr->str.c_str() + 1);
+			// The name may still be declared as a property LATER in this module, in
+			// which case this use also silently became a wire. Remember it so the
+			// declaration can refuse it rather than let it pass.
+			sva_procedural_refs.emplace(expr->str, loc);
 		}
 
 		void ParseState::addWiretypeNode(std::string *name, AstNode* node)
@@ -559,8 +691,19 @@
 		std::unique_ptr<YOSYS_NAMESPACE_PREFIX AST::AstNode> clk_event;
 		// `disable iff (<expr>)` guard. nullptr => no guard.
 		std::unique_ptr<YOSYS_NAMESPACE_PREFIX AST::AstNode> disable;
-		// The property body, already lowered to a plain boolean expression.
+		// The antecedent of `|->` / `|=>`. nullptr => the body is a plain boolean
+		// with no implication. Antecedent and consequent are kept APART rather than
+		// pre-combined because assert and cover need different combinations of
+		// them: an implication for assert, a conjunction for cover (which counts
+		// only non-vacuous matches). See ParseState::buildSvaMatch.
+		std::unique_ptr<YOSYS_NAMESPACE_PREFIX AST::AstNode> antecedent;
+		// The consequent of the implication or -- when `antecedent` is null -- the
+		// whole boolean property body.
 		std::unique_ptr<YOSYS_NAMESPACE_PREFIX AST::AstNode> body;
+		// Source locations of the two operands and of the implication operator, so
+		// that the nodes synthesised in buildSvaMatch are attributed to the text the
+		// user actually wrote rather than to the whole statement.
+		Location ant_loc, op_loc, body_loc;
 		// Set when the body used non-overlapping implication (`|=>`), which
 		// samples the antecedent one clock earlier and therefore REQUIRES a
 		// clocking event and a one-cycle-wider `disable iff` guard.
@@ -672,7 +815,7 @@
 %type <ast_node_type_t> asgn_binop inc_or_dec_op
 %type <ast_t> genvar_identifier
 %type <ast_t> sva_clocking_event sva_opt_clocking_event sva_disable_iff sva_opt_disable_iff
-%type <ast_t> sva_implication sva_prop_expr
+%type <sva_property_ptr_t> sva_implication sva_prop_expr
 %type <sva_property_ptr_t> sva_property_spec sva_inline_property_spec
 
 %type <specify_target_ptr_t> specify_target
@@ -820,7 +963,7 @@ module:
 		// SVA property declarations are scoped to the module that declares them.
 		extra->sva_properties.clear();
 		extra->sva_pending_refs.clear();
-		extra->sva_saw_nonoverlapping = false;
+		extra->sva_procedural_refs.clear();
 		mod->str = *$4;
 		append_attr(mod, std::move($1));
 	} module_para_opt module_args_opt TOK_SEMICOL module_body TOK_ENDMODULE opt_label {
@@ -2712,42 +2855,45 @@ assert:
 	// block already supplies exactly the sampling semantics the implication needs,
 	// so it is accepted and lowered, with a warning naming the portable spelling.
 	opt_sva_label TOK_ASSERT opt_property TOK_LPAREN sva_implication TOK_RPAREN TOK_SEMICOL {
-		extra->sva_saw_nonoverlapping = false;
 		warn_at_loc(@5, "SVA implication inside an immediate `assert(...)' is not standard "
 				"SystemVerilog. It is accepted and lowered to the equivalent boolean; "
-				"the portable spelling is `assert property (@(posedge <clk>) a |-> b);'.");
+				"the portable spelling is `assert property (@(posedge <clk>) a %s b);'.",
+			    $5->nonoverlapping ? "|=>" : "|->");
 		if (mode->noassert) {
 		} else {
-			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, mode->assume_asserts ? AST_ASSUME : AST_ASSERT, std::move($5)));
+			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, mode->assume_asserts ? AST_ASSUME : AST_ASSERT, extra->buildSvaMatch(*$5, /*cover=*/false, @5)));
 			SET_AST_NODE_LOC(node, ($1 != nullptr ? @1 : @2), @6);
 			if ($1 != nullptr)
 				node->str = *$1;
 		}
 	} |
 	opt_sva_label TOK_ASSUME opt_property TOK_LPAREN sva_implication TOK_RPAREN TOK_SEMICOL {
-		extra->sva_saw_nonoverlapping = false;
 		warn_at_loc(@5, "SVA implication inside an immediate `assume(...)' is not standard "
 				"SystemVerilog. It is accepted and lowered to the equivalent boolean; "
-				"the portable spelling is `assume property (@(posedge <clk>) a |-> b);'.");
+				"the portable spelling is `assume property (@(posedge <clk>) a %s b);'.",
+			    $5->nonoverlapping ? "|=>" : "|->");
 		if (mode->noassume) {
 		} else {
-			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, mode->assert_assumes ? AST_ASSERT : AST_ASSUME, std::move($5)));
+			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, mode->assert_assumes ? AST_ASSERT : AST_ASSUME, extra->buildSvaMatch(*$5, /*cover=*/false, @5)));
 			SET_AST_NODE_LOC(node, ($1 != nullptr ? @1 : @2), @6);
 			if ($1 != nullptr)
 				node->str = *$1;
 		}
 	} |
 	opt_sva_label TOK_COVER opt_property TOK_LPAREN sva_implication TOK_RPAREN TOK_SEMICOL {
-		extra->sva_saw_nonoverlapping = false;
+		// cover counts only NON-VACUOUS matches, so this lowers to the conjunction
+		// (`a && b`), not to the implication -- exactly like `cover property`.
 		warn_at_loc(@5, "SVA implication inside an immediate `cover(...)' is not standard "
-				"SystemVerilog. It is accepted and lowered to the equivalent boolean; "
-				"the portable spelling is `cover property (@(posedge <clk>) a |-> b);'.");
-		AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_COVER, std::move($5)));
+				"SystemVerilog. It is accepted and lowered to a non-vacuous match; "
+				"the portable spelling is `cover property (@(posedge <clk>) a %s b);'.",
+			    $5->nonoverlapping ? "|=>" : "|->");
+		AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_COVER, extra->buildSvaMatch(*$5, /*cover=*/true, @5)));
 		SET_AST_NODE_LOC(node, ($1 != nullptr ? @1 : @2), @6);
 		if ($1 != nullptr)
 			node->str = *$1;
 	} |
 	opt_sva_label TOK_ASSERT opt_property TOK_LPAREN expr TOK_RPAREN TOK_SEMICOL {
+		extra->rejectProceduralSvaProperty($5, @5);
 		if (mode->noassert) {
 
 		} else {
@@ -2758,6 +2904,7 @@ assert:
 		}
 	} |
 	opt_sva_label TOK_ASSUME opt_property TOK_LPAREN expr TOK_RPAREN TOK_SEMICOL {
+		extra->rejectProceduralSvaProperty($5, @5);
 		if (mode->noassume) {
 		} else {
 			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, mode->assert_assumes ? AST_ASSERT : AST_ASSUME, std::move($5)));
@@ -2785,6 +2932,7 @@ assert:
 		}
 	} |
 	opt_sva_label TOK_COVER opt_property TOK_LPAREN expr TOK_RPAREN TOK_SEMICOL {
+		extra->rejectProceduralSvaProperty($5, @5);
 		AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_COVER, std::move($5)));
 		SET_AST_NODE_LOC(node, ($1 != nullptr ? @1 : @2), @6);
 		if ($1 != nullptr) {
@@ -2806,6 +2954,7 @@ assert:
 		}
 	} |
 	opt_sva_label TOK_RESTRICT opt_property TOK_LPAREN expr TOK_RPAREN TOK_SEMICOL {
+		extra->rejectProceduralSvaProperty($5, @5);
 		if (mode->norestrict) {
 		} else {
 			AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_ASSUME, std::move($5)));
@@ -2916,20 +3065,38 @@ assert_property:
 //              assert|assume|cover|restrict property (<name>);
 //              assert|assume|cover|restrict property (@(edge clk) [disable iff (e)] <prop>);
 //              <prop> ::= <boolean> | <boolean> |-> <boolean> | <boolean> |=> <boolean>
+//
+// All of these live at MODULE scope. A named property instantiated inside a
+// procedural block is refused by ParseState::rejectProceduralSvaProperty rather
+// than silently degraded to an implicitly declared wire.
+//
+// assert/assume/restrict and cover get DIFFERENT lowerings of the same property:
+// cover counts only non-vacuous matches. See ParseState::buildSvaMatch.
+//
 // NOT supported (and diagnosed as such): sequences, `##` delays, repetition,
-//              `throughout`, `within`, property arguments, multi-clock properties.
+//              `throughout`, `within`, property arguments, multi-clock
+//              properties, parenthesised implication `(a |-> b)`.
 // ---------------------------------------------------------------------------
 
+// Every other piece of the new SVA grammar is unreachable without a token the
+// lexer only produces in formal mode (`|->`, `|=>`, `disable iff`,
+// `endproperty`). A clocking event is spelled with tokens that have always
+// existed, so THIS is the one production that has to enforce the formal gate
+// itself -- otherwise `read_verilog -sv` without `-formal` would silently accept
+// `assert property (@(posedge clk) e);`, which is a hard syntax error on main.
 sva_clocking_event:
 	TOK_AT TOK_LPAREN TOK_POSEDGE expr TOK_RPAREN {
+		SVA_REQUIRE_FORMAL(@1);
 		$$ = std::make_unique<AstNode>(@$, AST_POSEDGE, std::move($4));
 		SET_AST_NODE_LOC($$.get(), @1, @5);
 	} |
 	TOK_AT TOK_LPAREN TOK_NEGEDGE expr TOK_RPAREN {
+		SVA_REQUIRE_FORMAL(@1);
 		$$ = std::make_unique<AstNode>(@$, AST_NEGEDGE, std::move($4));
 		SET_AST_NODE_LOC($$.get(), @1, @5);
 	} |
 	TOK_AT TOK_LPAREN expr TOK_RPAREN {
+		SVA_REQUIRE_FORMAL(@1);
 		err_at_loc(@3, "An SVA property needs an edge-triggered clocking event "
 			       "(`@(posedge <clk>)' or `@(negedge <clk>)'); level-sensitive "
 			       "clocking is not supported.");
@@ -2956,34 +3123,33 @@ sva_opt_disable_iff:
 		$$ = nullptr;
 	};
 
+// The implication operands are carried up SEPARATELY (antecedent + consequent)
+// rather than pre-combined into one boolean, because assert and cover need
+// different combinations of them -- see ParseState::buildSvaMatch. Doing the
+// combination there, once, is what keeps the two lowerings from drifting apart.
 sva_implication:
 	expr OP_SVA_IMPLY expr {
-		// `a |-> b` is checked in the same cycle, so it is exactly `!a || b`.
-		$$ = std::make_unique<AstNode>(@$, AST_LOGIC_OR,
-			std::make_unique<AstNode>(@1, AST_LOGIC_NOT, std::move($1)), std::move($3));
-		SET_AST_NODE_LOC($$.get(), @1, @3);
+		// `a |-> b`: the consequent is checked in the SAME cycle as the antecedent.
+		$$ = std::make_unique<sva_property_spec>();
+		$$->antecedent = std::move($1);
+		$$->body = std::move($3);
+		$$->nonoverlapping = false;
+		$$->ant_loc = @1; $$->op_loc = @2; $$->body_loc = @3;
 	} |
 	expr OP_SVA_IMPLY_NEXT expr {
-		// `a |=> b` checks b one clock AFTER a, i.e. `!$past(a) || b`.
-		// $initstate excludes the very first cycle, where "one cycle ago" does not
-		// exist: the $past register's initial value is unconstrained in a formal
-		// flow, so without this term the solver could manufacture a counterexample
-		// out of a cycle the design never executes.
-		auto past = std::make_unique<AstNode>(@1, AST_FCALL, std::move($1));
-		past->str = "\\$past";
-		auto initstate = std::make_unique<AstNode>(@2, AST_FCALL);
-		initstate->str = "\\$initstate";
-		$$ = std::make_unique<AstNode>(@$, AST_LOGIC_OR, std::move(initstate),
-			std::make_unique<AstNode>(@$, AST_LOGIC_OR,
-				std::make_unique<AstNode>(@1, AST_LOGIC_NOT, std::move(past)),
-				std::move($3)));
-		SET_AST_NODE_LOC($$.get(), @1, @3);
-		extra->sva_saw_nonoverlapping = true;
+		// `a |=> b`: the consequent is checked one clock AFTER the antecedent, so
+		// the antecedent is sampled through $past.
+		$$ = std::make_unique<sva_property_spec>();
+		$$->antecedent = std::move($1);
+		$$->body = std::move($3);
+		$$->nonoverlapping = true;
+		$$->ant_loc = @1; $$->op_loc = @2; $$->body_loc = @3;
 	};
 
 sva_prop_expr:
 	expr {
-		$$ = std::move($1);
+		$$ = std::make_unique<sva_property_spec>();
+		$$->body = std::move($1);
 	} |
 	sva_implication {
 		$$ = std::move($1);
@@ -2991,35 +3157,23 @@ sva_prop_expr:
 
 sva_property_spec:
 	sva_opt_clocking_event sva_opt_disable_iff sva_prop_expr {
-		$$ = std::make_unique<sva_property_spec>();
+		$$ = std::move($3);
 		$$->clk_event = std::move($1);
 		$$->disable = std::move($2);
-		$$->body = std::move($3);
-		$$->nonoverlapping = extra->sva_saw_nonoverlapping;
-		extra->sva_saw_nonoverlapping = false;
 	};
 
 sva_inline_property_spec:
 	sva_clocking_event sva_opt_disable_iff sva_prop_expr {
-		$$ = std::make_unique<sva_property_spec>();
+		$$ = std::move($3);
 		$$->clk_event = std::move($1);
 		$$->disable = std::move($2);
-		$$->body = std::move($3);
-		$$->nonoverlapping = extra->sva_saw_nonoverlapping;
-		extra->sva_saw_nonoverlapping = false;
 	} |
 	sva_disable_iff sva_prop_expr {
-		$$ = std::make_unique<sva_property_spec>();
+		$$ = std::move($2);
 		$$->disable = std::move($1);
-		$$->body = std::move($2);
-		$$->nonoverlapping = extra->sva_saw_nonoverlapping;
-		extra->sva_saw_nonoverlapping = false;
 	} |
 	sva_implication {
-		$$ = std::make_unique<sva_property_spec>();
-		$$->body = std::move($1);
-		$$->nonoverlapping = extra->sva_saw_nonoverlapping;
-		extra->sva_saw_nonoverlapping = false;
+		$$ = std::move($1);
 	};
 
 sva_opt_semicol:
@@ -3032,6 +3186,15 @@ sva_property_decl:
 		// A use that came BEFORE this declaration did not see the property: it fell
 		// through to the ordinary expression path and became an implicitly declared
 		// wire, so the assertion would have proved nothing at all. Refuse it.
+		// Same story for a use inside a PROCEDURAL block, which is not a supported
+		// spelling at all -- report the reason it is refused, not just the order.
+		auto proc = extra->sva_procedural_refs.find(*$2);
+		if (proc != extra->sva_procedural_refs.end())
+			err_at_loc(proc->second, "SVA property `%s' cannot be instantiated inside a "
+						 "procedural block. Move `assert property (%s);' out to "
+						 "module scope; the property may carry its own "
+						 "`@(posedge <clk>)' clocking event.",
+				   $2->c_str() + 1, $2->c_str() + 1);
 		auto pending = extra->sva_pending_refs.find(*$2);
 		if (pending != extra->sva_pending_refs.end())
 			err_at_loc(pending->second, "SVA property `%s' is used before it is declared.",

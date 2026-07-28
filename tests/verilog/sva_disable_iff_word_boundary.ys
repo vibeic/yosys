@@ -1,0 +1,20 @@
+# `disable iff' is lexed as one token, but it must not swallow the `iff' prefix
+# of a longer identifier. `disable iffy (...)' below is a module named `disable'
+# instantiated as `iffy' -- plain Verilog that parses on the base front end, and
+# that must keep parsing in formal mode, which is exactly the mode this feature
+# targets.
+read_verilog -formal -sv <<EOT
+module disable (input x, output y);
+	assign y = x;
+endmodule
+
+module top (input clk, input a, output b, input c, input d, input r);
+	disable iffy (.x(a), .y(b));
+	assert property (@(posedge clk) disable iff (r) c |-> d);
+endmodule
+EOT
+hierarchy -top top
+proc
+# the instance survived AND the real `disable iff' guard still lowered
+select -assert-count 1 top/t:disable
+select -assert-count 1 top/t:$check

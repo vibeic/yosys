@@ -432,8 +432,14 @@ TIME_SCALE_SUFFIX [munpf]?s
 
  /* `disable iff` is lexed as ONE token: `disable` on its own stays whatever it
     is today (an identifier / the plain-Verilog block-disable keyword), so the
-    only construct affected is the SVA clocking-guard spelling. */
-"disable"[ \t\r\n]+"iff" {
+    only construct affected is the SVA clocking-guard spelling.
+
+    The trailing context is load-bearing: without it this rule matches the `iff`
+    PREFIX of a longer identifier, so `disable iffy (...)' -- a module named
+    `disable' instantiated with a port list, which plain Verilog accepts -- would
+    lex as TOK_SVA_DISABLE_IFF followed by a stray `y' and become a hard syntax
+    error in formal mode. */
+"disable"[ \t\r\n]+"iff"/[^a-zA-Z0-9_$] {
 	if (mode->formal) return parser::make_TOK_SVA_DISABLE_IFF(out_loc);
 	yyless(7);
 	RETRACK_LOC(7);

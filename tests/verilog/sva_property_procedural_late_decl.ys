@@ -1,0 +1,13 @@
+# The same refusal must hold when the property is declared AFTER the procedural
+# use. At the point of use the name is not yet known, so it cannot be recognised
+# there; the use is remembered and the declaration reports it, rather than
+# leaving an implicitly declared wire behind.
+logger -expect error "SVA property .p_ab. cannot be instantiated inside a procedural block" 1
+read_verilog -formal -sv <<EOT
+module top (input clk, input a, input b);
+	always @(posedge clk) a_proc: assert property (p_ab);
+	property p_ab;
+		@(posedge clk) a |-> b;
+	endproperty
+endmodule
+EOT

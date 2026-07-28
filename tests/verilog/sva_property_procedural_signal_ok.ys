@@ -1,0 +1,23 @@
+# The other direction: an ordinary signal in a procedural assert/assume/cover is
+# NOT an SVA property and must keep working exactly as it always has. Only a
+# bare identifier that resolves to a DECLARED property is refused, so this file
+# must parse cleanly and emit one $check per statement.
+#
+# Without this file the refusal above could be a blanket rejection of every
+# procedural assertion and the test suite would not notice.
+read_verilog -formal -sv <<EOT
+module top (input clk, input ready, input a, input b);
+	always @(posedge clk) a_sig:  assert property (ready);
+	always @(posedge clk) a_imm:  assert (ready);
+	always @(posedge clk) m_sig:  assume property (ready);
+	always @(posedge clk) c_sig:  cover  property (ready);
+	always @(posedge clk) r_sig:  restrict property (ready);
+	always @(posedge clk) a_expr: assert property (a && !b);
+endmodule
+EOT
+hierarchy -top top
+proc
+select -assert-count 6 t:$check
+# the identifier really is the module port, not an implicitly declared wire
+select -assert-count 1 w:ready
+select -assert-count 1 w:ready %a i:* %i

@@ -1,0 +1,14 @@
+# The formal gate has to be enforced by the GRAMMAR, not only by the lexer.
+#
+# `|->', `|=>', `disable iff' and `endproperty' are tokens the lexer only
+# produces in formal mode, so every production that needs one is already gated.
+# An inline property spec that starts with a clocking event is spelled entirely
+# with tokens that have always existed, so it is reachable without `-formal' and
+# must refuse itself. Without this, a plain synthesis read would silently accept
+# an assertion and emit a $check cell where it used to hard-error.
+logger -expect error "only accepted with .read_verilog -formal" 1
+read_verilog -sv <<EOT
+module top (input clk, input a, input b);
+	assert property (@(posedge clk) !(a && b));
+endmodule
+EOT

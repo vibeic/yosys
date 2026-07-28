@@ -368,24 +368,74 @@ so no proof engine has to learn about SVA. Supported:
   assertion in a clocked block (``always @(posedge clk) assert (a |-> b);``).
   IEEE 1800 does not allow this, so it is accepted with a warning.
 
+``cover property`` counts only non-vacuous matches
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``assert`` asks whether a property *holds*, and an implication whose antecedent
+never fires holds **vacuously** -- so the lowerings above are the right ones for
+``assert``, ``assume`` and ``restrict``.
+
+``cover`` asks a different question: whether the scenario actually *happened*.
+IEEE 1800-2017 clause 16.12.9 counts only non-vacuous matches, so ``cover``
+lowers an implication to the **conjunction** rather than the implication:
+
+==============================  ====================================================
+property under ``cover``        lowered to
+==============================  ====================================================
+``a |-> b``                     ``a && b``
+``a |=> b``                     ``!$initstate && $past(a) && b``
+``disable iff (D) a |-> b``     ``!D && (a && b)``
+``disable iff (D) a |=> b``     ``!(D || $past(D)) && !$initstate && $past(a) && b``
+``<boolean>`` (no implication)  ``<boolean>``
+==============================  ====================================================
+
+Note that ``disable iff`` enters the two lowerings differently. A disabled
+attempt produces neither a failure nor a match, so ``assert`` passes over it
+(``D || ...``) while ``cover`` must not count it (``!D && ...``).
+
+Lowering ``cover`` to the implication would make the standard anti-vacuity
+check -- the very idiom engineers use to show that an assertion is not vacuous
+-- a check that can never fail, and would report a property as covered in a run
+that never exercised it.
+
+Scope and diagnostics
+~~~~~~~~~~~~~~~~~~~~~
+
 A property must be declared before it is used. A use that comes first would
 otherwise fall through to the ordinary expression path, turn the property name
 into an implicitly declared wire, and leave an assertion that proves nothing --
 so that case is reported as an error rather than silently passing.
 
-Not supported. Three of these are diagnosed by name, so the message says what is
-missing instead of pointing at a token:
+For the same reason, a named property may only be instantiated at **module
+scope**. Writing ``always @(posedge clk) assert property (p);`` is legal IEEE
+1800, but a named property is lowered at its point of use into an ``always``
+block of its own and there is no way to reconcile that with an enclosing
+procedural block, so it is refused with a message naming the module-scope
+spelling. An ordinary signal in a procedural ``assert``/``assume``/``cover``/
+``restrict`` is unaffected; only a bare identifier that resolves to a declared
+property is refused.
+
+The whole subset is behind ``-formal``. Without it, ``read_verilog`` rejects
+these constructs exactly as it did before the subset existed.
+
+Not supported. These are diagnosed by name, so the message says what is missing
+instead of pointing at a token:
 
 - the sequence delay ``##N``,
 - a level-sensitive clocking event such as ``@(clk)``,
-- ``|=>`` on a property that has no clocking event.
+- ``|=>`` on a property that has no clocking event,
+- a named property instantiated inside a procedural block,
+- a property used before it is declared.
 
-The rest still produce an ordinary syntax error: ``sequence`` ..
-``endsequence`` blocks, repetition (``[*n]``, ``[->n]``, ``[=n]``),
-``throughout``, ``within``, ``intersect``, properties with arguments,
-multi-clock properties, chained implications (``a |-> b |-> c``), and assertion
-action blocks (``assert property (...) else $error(...);``). For full SVA
-support use a front end that has it, such as the slang front end or Verific.
+The rest still produce an ordinary syntax error, which names a token rather than
+the construct: ``sequence`` .. ``endsequence`` blocks, repetition (``[*n]``,
+``[->n]``, ``[=n]``), ``throughout``, ``within``, ``intersect``, ``first_match``,
+``not``/``and``/``or`` over properties, properties with arguments, multi-clock
+properties, ``default clocking``, chained implications (``a |-> b |-> c``), a
+**parenthesised** implication (``assert property (@(posedge clk) (a |-> b));``),
+and assertion action blocks (``assert property (...) else $error(...);``). For
+full SVA support use a front end that has it, such as the slang front end or
+Verific.
 
 
 Supported features from SystemVerilog
