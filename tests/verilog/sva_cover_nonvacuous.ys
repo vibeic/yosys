@@ -1,0 +1,147 @@
+# `cover property' counts only NON-VACUOUS matches.
+#
+# assert asks "does the property hold?", and an implication whose antecedent
+# never fires holds VACUOUSLY -- so assert lowers to the implication `!a || b'.
+# cover asks "did this scenario actually happen?", and IEEE 1800-2017 16.12.9
+# counts only non-vacuous matches -- so cover lowers to the CONJUNCTION `a && b'.
+#
+# Lowering cover to the implication makes the standard anti-vacuity check -- the
+# very idiom used to show an assertion is not vacuous -- a check that can never
+# fail: a run that never exercised the property would report it as covered.
+#
+# The two lowerings are told apart structurally here: the conjunction is a
+# $logic_and with the antecedent and the consequent on its inputs, and it carries
+# NO $logic_not, which the implication necessarily does.
+
+# ---------------------------------------------------------------------------
+# overlapping implication: cover -> a && b
+# ---------------------------------------------------------------------------
+read_verilog -formal -sv <<EOT
+module top (input clk, input a, input b);
+	c_ovl: cover property (@(posedge clk) a |-> b);
+endmodule
+EOT
+hierarchy -top top
+proc
+opt_clean
+select -assert-count 1 t:$check
+select -assert-count 1 t:$logic_and
+select -assert-count 0 t:$logic_or
+select -assert-count 0 t:$logic_not
+# both operands really are the antecedent and the consequent
+select -assert-count 1 t:$logic_and %ci w:a %i
+select -assert-count 1 t:$logic_and %ci w:b %i
+
+# ---------------------------------------------------------------------------
+# the SAME property under assert keeps the implication lowering
+# ---------------------------------------------------------------------------
+design -reset
+read_verilog -formal -sv <<EOT
+module top (input clk, input a, input b);
+	a_ovl: assert property (@(posedge clk) a |-> b);
+endmodule
+EOT
+hierarchy -top top
+proc
+opt_clean
+select -assert-count 1 t:$check
+select -assert-count 0 t:$logic_and
+select -assert-count 1 t:$logic_or
+select -assert-count 1 t:$logic_not
+
+# ---------------------------------------------------------------------------
+# non-overlapping implication: cover -> !$initstate && $past(a) && b
+# The first cycle cannot contain a match, because no attempt can have STARTED
+# one cycle before it; the $past register's initial value is unconstrained in a
+# formal flow, so without the $initstate term the solver could manufacture one.
+# ---------------------------------------------------------------------------
+design -reset
+read_verilog -formal -sv <<EOT
+module top (input clk, input a, input b);
+	c_novl: cover property (@(posedge clk) a |=> b);
+endmodule
+EOT
+hierarchy -top top
+proc
+opt_clean
+select -assert-count 1 t:$check
+select -assert-count 2 t:$logic_and
+select -assert-count 0 t:$logic_or
+# the single inverter is the one on $initstate, so the first cycle is excluded
+select -assert-count 1 t:$logic_not
+select -assert-count 1 t:$initstate
+select -assert-count 1 t:$initstate %co %co t:$logic_not %i
+# the antecedent is sampled one cycle back, so `a' feeds a $past register and
+# NOT the conjunction directly
+select -assert-count 0 t:$logic_and %ci w:a %i
+select -assert-count 1 t:$logic_and %ci w:b %i
+
+# ---------------------------------------------------------------------------
+# `disable iff': a DISABLED attempt yields neither a failure nor a match, so
+# the guard is disjunctive for assert (`D || ...') and conjunctive-negated for
+# cover (`!D && ...').
+# ---------------------------------------------------------------------------
+design -reset
+read_verilog -formal -sv <<EOT
+module top (input clk, input a, input b, input r);
+	c_dis: cover property (@(posedge clk) disable iff (r) a |-> b);
+endmodule
+EOT
+hierarchy -top top
+proc
+opt_clean
+select -assert-count 1 t:$check
+select -assert-count 2 t:$logic_and
+select -assert-count 0 t:$logic_or
+select -assert-count 1 t:$logic_not
+# the inverter is on the disable guard, not on the antecedent
+select -assert-count 1 t:$logic_not %ci w:r %i
+select -assert-count 0 t:$logic_not %ci w:a %i
+
+# ---------------------------------------------------------------------------
+# A named property gets exactly the same treatment as the inline spelling, and
+# the non-standard immediate `cover (a |-> b)' cannot be used to sidestep it.
+# ---------------------------------------------------------------------------
+design -reset
+read_verilog -formal -sv <<EOT
+module top (input clk, input a, input b);
+	property p_ab;
+		@(posedge clk) a |-> b;
+	endproperty
+	c_named: cover property (p_ab);
+endmodule
+EOT
+hierarchy -top top
+proc
+opt_clean
+select -assert-count 1 t:$logic_and
+select -assert-count 0 t:$logic_not
+
+design -reset
+read_verilog -formal -sv <<EOT
+module top (input clk, input a, input b);
+	always @(posedge clk) c_imm: cover (a |-> b);
+endmodule
+EOT
+hierarchy -top top
+proc
+opt_clean
+select -assert-count 1 t:$logic_and
+select -assert-count 0 t:$logic_not
+
+# ---------------------------------------------------------------------------
+# A cover with no implication has nothing to be vacuous about, so it is
+# unchanged: the body is the match.
+# ---------------------------------------------------------------------------
+design -reset
+read_verilog -formal -sv <<EOT
+module top (input clk, input a, input b);
+	c_plain: cover property (@(posedge clk) a || b);
+endmodule
+EOT
+hierarchy -top top
+proc
+opt_clean
+select -assert-count 1 t:$logic_or
+select -assert-count 0 t:$logic_and
+select -assert-count 0 t:$logic_not
