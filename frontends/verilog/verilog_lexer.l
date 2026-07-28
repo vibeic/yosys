@@ -77,8 +77,19 @@ YOSYS_NAMESPACE_END
 	string_t val = std::make_unique<std::string>(std::string("\\") + YYText()); \
 	return parser::make_TOK_ID(std::move(val), out_loc);
 
+/* A word that is a keyword only in some modes, falling back to whatever it was
+   in the modes where it is not. That fallback has to be the WHOLE identifier
+   rule, `isUserType` lookup included: a name reached through this macro may
+   have been typedef'd, and returning TOK_ID for it where the identifier rule
+   would have returned TOK_USER_TYPE turns a file that used to parse into a
+   syntax error. */
 #define NON_KEYWORD() \
-	string_t val = std::make_unique<std::string>(std::string("\\") + YYText()); \
+	auto non_keyword_s = std::string("\\") + YYText(); \
+	if (isUserType(extra, non_keyword_s)) { \
+		string_t val = std::make_unique<std::string>(non_keyword_s); \
+		return parser::make_TOK_USER_TYPE(std::move(val), out_loc); \
+	} \
+	string_t val = std::make_unique<std::string>(non_keyword_s); \
 	return parser::make_TOK_ID(std::move(val), out_loc);
 
 /* YY_USER_ACTION has already advanced out_loc over the WHOLE match. After a
