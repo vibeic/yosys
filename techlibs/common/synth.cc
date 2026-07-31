@@ -98,9 +98,6 @@ struct SynthPass : public ScriptPass {
 		log("    -abc9\n");
 		log("        use new ABC9 flow (EXPERIMENTAL)\n");
 		log("\n");
-		log("    -flowmap\n");
-		log("        use FlowMap LUT techmapping instead of ABC\n");
-		log("\n");
 		log("    -no-rw-check\n");
 		log("        marks all recognized read ports as \"return don't-care value on\n");
 		log("        read/write collision\" (same result as setting the no_rw_check\n");
@@ -121,7 +118,7 @@ struct SynthPass : public ScriptPass {
 	}
 
 	string top_module, fsm_opts, memory_opts, abc, latches_opt;
-	bool autotop, flatten, noalumacc, nofsm, noabc, noshare, flowmap, booth, arith_tree, hieropt, relative_share;
+	bool autotop, flatten, noalumacc, nofsm, noabc, noshare, booth, arith_tree, hieropt, relative_share;
 	// vibeic fork: run 'tribuf -logic' by default so tri-state driver fanin
 	// (e.g. `assign io = oe ? val : 1'bz`) is preserved as a $_TBUF_ cell and
 	// is not dropped by opt as a don't-care. -notribuf restores old behaviour.
@@ -144,7 +141,6 @@ struct SynthPass : public ScriptPass {
 		noabc = false;
 		noshare = false;
 		notribuf = false; // vibeic fork
-		flowmap = false;
 		booth = false;
 		arith_tree = false;
 		hieropt = false;
@@ -231,10 +227,6 @@ struct SynthPass : public ScriptPass {
 				abc = "abc9";
 				continue;
 			}
-			if (args[argidx] == "-flowmap") {
-				flowmap = true;
-				continue;
-			}
 			if (args[argidx] == "-no-rw-check") {
 				memory_opts += " -no-rw-check";
 				continue;
@@ -261,8 +253,6 @@ struct SynthPass : public ScriptPass {
 
 		if (abc == "abc9" && !lut)
 			log_cmd_error("ABC9 flow only supported for FPGA synthesis (using '-lut' option)\n");
-		if (flowmap && !lut)
-			log_cmd_error("FlowMap is only supported for FPGA synthesis (using '-lut' option)\n");
 
 		log_header(design, "Executing SYNTH pass.\n");
 		log_push();
@@ -356,16 +346,13 @@ struct SynthPass : public ScriptPass {
 			if (help_mode) {
 				run(techmap_cmd + " -map +/gate2lut.v", "(if -noabc and -lut)");
 				run("clean; opt_lut", "           (if -noabc and -lut)");
-				run("flowmap -maxlut K", "        (if -flowmap and -lut)");
 			} else if (noabc && lut) {
 				run(stringf("%s -map +/gate2lut.v -D LUT_WIDTH=%d", techmap_cmd, lut));
 				run("clean; opt_lut");
-			} else if (flowmap) {
-				run(stringf("flowmap -maxlut %d", lut));
 			}
 			run("opt -fast" + hieropt_flag);
 
-			if ((!noabc && !flowmap) || help_mode) {
+			if (!noabc || help_mode) {
 #ifdef YOSYS_ENABLE_ABC
 				if (help_mode) {
 					run(abc, "       (unless -noabc, unless -lut)");
