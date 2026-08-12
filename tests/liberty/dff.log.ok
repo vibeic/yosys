@@ -26,4 +26,6 @@
     unmapped dff cell: $_DFFSR_PNP_
     unmapped dff cell: $_DFFSR_PPN_
     unmapped dff cell: $_DFFSR_PPP_
+    unmapped dff cell: $_DLATCH_N_
+    unmapped dff cell: $_DLATCH_P_
 dfflegalize command line: dfflegalize -cell $_DFF_P_ 01 t:$_DFF* t:$_SDFF*
