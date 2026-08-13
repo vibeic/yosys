@@ -50,18 +50,32 @@ GOLDEN = HERE / "dff.log.ok"
 
 #: `logmap(ID($_DFF_P_));` -> `$_DFF_P_`
 LOGMAP_RE = re.compile(r"^\s*logmap\(ID\((\$\S+?)\)\);\s*$")
-#: the line that opens the block logmap_all() prints
-BLOCK_OPEN = "final dff cell mappings:"
-#: `    unmapped dff cell: $_DFF_N_`
-UNMAPPED_RE = re.compile(r"^ {4}unmapped dff cell: (\$\S+)$")
+#: `log("  final dff/dlatch cell mappings:\n");` -> `final dff/dlatch cell mappings:`
+#: The wording is DERIVED, not restated: upstream PR #6072 renamed both labels
+#: ("dff" -> "dff/dlatch") in the same commit that regenerated the golden, and a
+#: hardcoded copy here turned that coordinated rename into a spurious failure.
+BLOCK_OPEN_RE = re.compile(r'log\("\s*(final\b[^"\\]*cell mappings:)\\n"\)')
+#: `log("    unmapped dff/dlatch cell: %s\n", dff);` -> `unmapped dff/dlatch cell: `
+UNMAPPED_LABEL_RE = re.compile(r'log\("\s*(unmapped\b[^"\\%]*?:\s)%s\\n"')
 #: `    \dff _DFF_P_ (.CLK( C), ...` — logmap() prints the cell id with its
 #: leading `$` stripped, so it is put back before comparing.
 MAPPED_RE = re.compile(r"^ {4}\S+ (\S+) \(")
 
 
-def cells_from_source(path: Path) -> list[str]:
+def labels_from_source(text: str, path: Path) -> tuple[str, re.Pattern]:
+    """The two row labels `dfflibmap -info` prints, read off the C++ format strings."""
+    block = BLOCK_OPEN_RE.search(text)
+    unmapped = UNMAPPED_LABEL_RE.search(text)
+    for name, hit in (("final ... cell mappings:", block), ("unmapped ... cell:", unmapped)):
+        if not hit:
+            # A parser that silently finds nothing would make this check pass on
+            # everything, which is the failure mode it exists to prevent.
+            raise SystemExit(f"{path}: could not locate the {name!r} log() format string")
+    return block.group(1), re.compile(r"^ {4}" + re.escape(unmapped.group(1)) + r"(\$\S+)$")
+
+
+def cells_from_source(text: str, path: Path) -> list[str]:
     """The ordered cell ids logmap_all() emits, read off the C++ body."""
-    text = path.read_text(encoding="utf-8", errors="replace")
     m = re.search(r"^static void logmap_all\(\)\s*\{(.*?)^\}", text, re.S | re.M)
     if not m:
         raise SystemExit(f"{path}: could not locate the body of logmap_all()")
@@ -74,18 +88,18 @@ def cells_from_source(path: Path) -> list[str]:
     return cells
 
 
-def cells_from_golden(path: Path) -> list[str]:
+def cells_from_golden(path: Path, block_open: str, unmapped_re: re.Pattern) -> list[str]:
     """The ordered cell ids the checked-in golden records."""
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     try:
-        start = next(i for i, l in enumerate(lines) if l.rstrip().endswith(BLOCK_OPEN))
+        start = next(i for i, l in enumerate(lines) if l.rstrip().endswith(block_open))
     except StopIteration:
-        raise SystemExit(f"{path}: no {BLOCK_OPEN!r} line — not a dfflibmap -info log")
+        raise SystemExit(f"{path}: no {block_open!r} line — not a dfflibmap -info log")
     cells: list[str] = []
     for line in lines[start + 1:]:
         if not line.startswith("    "):
             break                       # `dfflegalize command line:` closes the block
-        hit = UNMAPPED_RE.match(line)
+        hit = unmapped_re.match(line)
         if hit:
             cells.append(hit.group(1))
             continue
@@ -100,8 +114,10 @@ def cells_from_golden(path: Path) -> list[str]:
 
 
 def main() -> int:
-    src = cells_from_source(DFFLIBMAP_CC)
-    gold = cells_from_golden(GOLDEN)
+    text = DFFLIBMAP_CC.read_text(encoding="utf-8", errors="replace")
+    block_open, unmapped_re = labels_from_source(text, DFFLIBMAP_CC)
+    src = cells_from_source(text, DFFLIBMAP_CC)
+    gold = cells_from_golden(GOLDEN, block_open, unmapped_re)
 
     if src == gold:
         print(f"OK: {GOLDEN.name} records all {len(src)} logmap_all() cells, in order")
