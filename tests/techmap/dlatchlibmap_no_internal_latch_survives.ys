@@ -1,0 +1,73 @@
+# No $_DLATCH_* may survive dfflibmap into a technology-mapped netlist.
+#
+# This pins a decision, so it records the evidence for it.
+#
+# This fork used to carry a guard (in the commit upstream PR #6072 superseded)
+# that only handed latches to dfflegalize when the liberty provided a latch cell
+# "so a latch-free library never triggers latch emulation". Upstream instead
+# selects t:$_DLATCH* unconditionally. Resolving the merge meant choosing, and
+# the three library shapes were measured on both trees:
+#
+#   library            fork-guarded (pre-merge)       upstream (post-merge)
+#   ---------------------------------------------------------------------------
+#   has a latch cell   mapped                          mapped
+#   no latch, has SR   $_DLATCH_P_ LEFT UNMAPPED       emulated: dffsr + 2 gates
+#   no latch, no SR    $_DLATCH_P_ LEFT UNMAPPED       hard error, run aborts
+#
+# The guard was protecting the wrong thing. Leaving a yosys-internal $_DLATCH_P_
+# sitting in a netlist that dfflibmap has just declared technology-mapped is a
+# silently broken output -- exactly the failure class this fork exists to remove
+# -- and it did that in BOTH latch-free shapes, not just the one it was aimed at.
+# Upstream either maps it, emulates it correctly, or says it cannot. The guard
+# was therefore dropped deliberately rather than reapplied on merge.
+#
+# So what needs pinning is not the old guard but the property that replaced it:
+# whatever the library holds, no internal latch cell comes out the far side.
+
+read_verilog -icells <<EOT
+
+module top(input E, D, C, output Q, QF);
+
+$_DLATCH_P_ latch0 (.E(E), .D(D), .Q(Q));
+$_DFF_N_    ff0    (.C(C), .D(D), .Q(QF));
+
+endmodule
+
+EOT
+
+design -save orig
+
+select -assert-count 1 t:$_DLATCH_P_
+select -assert-count 1 t:$_DFF_N_
+
+##################################################################
+# dlatchlibmap.lib carries latch cells: the latch maps directly.
+# The flip-flop is dropped first -- that library has no FF, and failing on the
+# FF is the unrelated, long-standing behaviour for a library that cannot hold
+# a primitive the design uses.
+
+design -load orig
+delete t:$_DFF_N_
+dfflibmap -liberty dlatchlibmap.lib
+select -assert-count 0 t:$_DLATCH*
+select -assert-count 1 t:dlatchn
+
+##################################################################
+# dfflibmap.lib carries NO latch group at all, but does carry dffsr. This is the
+# row the old guard would have suppressed: the latch must still leave as mapped
+# library cells, built out of the set/reset primitive, not as $_DLATCH_P_.
+
+design -load orig
+dfflibmap -liberty dfflibmap.lib
+select -assert-count 0 t:$_DLATCH*
+select -assert-count 1 t:dffn
+select -assert-count 1 t:dffsr
+
+# -prepare runs dfflegalize too, so it must agree.
+design -load orig
+dfflibmap -prepare -liberty dfflibmap.lib
+select -assert-count 0 t:$_DLATCH*
+
+# The third row -- no latch and no SR -- aborts by design, which a .ys script
+# cannot assert against; tests/liberty/dff.log.ok pins that library's command
+# line instead.
