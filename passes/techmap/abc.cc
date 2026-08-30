@@ -32,6 +32,27 @@
 #define ABC_COMMAND_LIB "strash; &get -n; &fraig -x; &put; scorr; dc2; dretime; strash; &get -n; &dch -f; &nf {D}; &put"
 #define ABC_COMMAND_CTR "strash; &get -n; &fraig -x; &put; scorr; dc2; dretime; strash; &get -n; &dch -f; &nf {D}; &put; buffer; upsize {D}; dnsize {D}; stime -p"
 #define ABC_COMMAND_LUT "strash; &get -n; &fraig -x; &put; scorr; dc2; dretime; strash; dch -f; if; mfs2"
+// vibeic fork: the FAST mapping recipes upstream removed in 45e1de36b
+// ("abc: remove -fast (again)"; the "(again)" is upstream's own note that this
+// has been removed and restored before). Their loss is not a QoR preference —
+// it is a RUNTIME CLIFF, because `synth`'s only abc call went from `abc -fast`
+// to `abc` in c4cc53a72, so every synth now runs the full dch/&nf recipe.
+//
+// Measured on cvdp_copilot_gaussian_rounding_div_0022's 33k-cell Goldschmidt
+// `divider`, identical `synth -top divider` on identical RTL:
+//     yosys 0.40  (has -fast)   6.8 s, 32848 cells
+//     yosys 0.68+ (no -fast)    > 320 s, still inside
+//                               "Extracting gate netlist ... input.blif"
+// a 42x cliff that silently converts a correct design into a timeout. A
+// benchmark gate with a synth-smoke ceiling reads that as a design defect.
+//
+// Restored as an OPT-IN flag, exactly like this fork's -area_recover/-sizing:
+// default off, so the stock upstream recipe is unchanged for every caller that
+// does not ask, and a daily upstream merge does not have to fight a revert.
+#define ABC_FAST_COMMAND_LIB "strash; dretime; map {D}"
+#define ABC_FAST_COMMAND_CTR "strash; dretime; map {D}; buffer; upsize {D}; dnsize {D}; stime -p"
+#define ABC_FAST_COMMAND_LUT "strash; dretime; if"
+#define ABC_FAST_COMMAND_DFL "strash; dretime; map"
 #define ABC_COMMAND_DFL "strash; &get -n; &fraig -x; &put; scorr; dc2; dretime; strash; &get -n; &dch -f; &nf {D}; &put"
 
 #include "kernel/register.h"
@@ -139,6 +160,7 @@ struct AbcConfig
 	pool<std::string> enabled_gates;
 	bool cmos_cost = false;
 	// vibeic fork: opt-in standard-cell QoR recovery knobs (default off => stock behaviour).
+	bool fast_mode = false;       // vibeic fork: restore the removed -fast recipes
 	int area_recover_rounds = 0;  // extra ABC exact-area (&nf -A n) rounds; 0 = disabled
 	bool sizing_recover = false;  // append post-map gate-sizing (buffer/upsize/dnsize)
 
@@ -1071,13 +1093,17 @@ void AbcModuleState::prepare_module(RTLIL::Design *design, RTLIL::Module *module
 		for (int this_cost : config.lut_costs)
 			if (this_cost != config.lut_costs.front())
 				all_luts_cost_same = false;
-		run_abc.abc_script += ABC_COMMAND_LUT;
-		if (all_luts_cost_same)
+		run_abc.abc_script += config.fast_mode ? ABC_FAST_COMMAND_LUT
+		                                       : ABC_COMMAND_LUT;
+		if (all_luts_cost_same && !config.fast_mode)
 			run_abc.abc_script += "; lutpack -S 1";
 	} else if (!config.liberty_files.empty() || !config.genlib_files.empty())
-		run_abc.abc_script += config.constr_file.empty() ? ABC_COMMAND_LIB : ABC_COMMAND_CTR;
+		run_abc.abc_script += config.constr_file.empty()
+			? (config.fast_mode ? ABC_FAST_COMMAND_LIB : ABC_COMMAND_LIB)
+			: (config.fast_mode ? ABC_FAST_COMMAND_CTR : ABC_COMMAND_CTR);
 	else
-		run_abc.abc_script += ABC_COMMAND_DFL;
+		run_abc.abc_script += config.fast_mode ? ABC_FAST_COMMAND_DFL
+		                                       : ABC_COMMAND_DFL;
 
 	// vibeic fork: opt-in standard-cell QoR recovery, applied to the built-in
 	// -liberty/-genlib recipe only (not a user -script). Both operations are
@@ -1919,6 +1945,13 @@ struct AbcPass : public Pass {
 		log("        otherwise:\n");
 		log("%s\n", fold_abc_cmd(ABC_COMMAND_DFL));
 		log("\n");
+		log("    -fast\n");
+		log("        (vibeic) use the FAST mapping recipe upstream removed in 45e1de36b\n");
+		log("        ('abc: remove -fast (again)'). The full recipe is a runtime cliff on a\n");
+		log("        deep combinational cone: a 33k-cell Goldschmidt divider maps in 6.8s\n");
+		log("        under yosys 0.40 (which had -fast) and does not finish in 320s without\n");
+		log("        it. Default off, so the stock recipe is unchanged unless asked for.\n");
+		log("\n");
 		log("    -area_recover\n");
 		log("        (vibeic) run additional ABC exact-area mapping rounds ('&nf -A') on the\n");
 		log("        built-in -liberty/-genlib recipe, recovering area at equal delay. Has no\n");
@@ -2195,6 +2228,12 @@ struct AbcPass : public Pass {
 			}
 			if (arg == "-markgroups") {
 				config.markgroups = true;
+				continue;
+			}
+			if (arg == "-fast") {
+				// vibeic fork: restore the recipes 45e1de36b removed. See the
+				// ABC_FAST_COMMAND_* block for the 42x measurement.
+				config.fast_mode = true;
 				continue;
 			}
 			if (arg == "-area_recover") {

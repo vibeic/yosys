@@ -1,0 +1,42 @@
+# vibeic fork: `abc -fast` must exist, must map, and must be equivalent.
+#
+# Upstream removed the -fast recipes in 45e1de36b ("abc: remove -fast (again)")
+# and synth's abc call lost the flag with it in c4cc53a72, so every synth now
+# runs the full dch/&nf recipe. On a deep combinational cone that is a runtime
+# cliff, not a QoR preference: a 33k-cell Goldschmidt divider maps in 6.8s under
+# yosys 0.40 (which had -fast) and does not finish in 320s without it.
+#
+# This pins all three properties the restoration has to hold:
+#   1. the flag parses at all (a merge that drops it fails here, loudly)
+#   2. it MAPS -- gate cells exist afterwards, so "fast" is not "skipped"
+#   3. the mapping is EQUIVALENT to the unmapped logic
+read_verilog <<EOT
+module top(input clk, input [7:0] a, b, input s, output reg [8:0] q);
+	wire [8:0] sum = a + b;
+	wire [8:0] dif = a - b;
+	always @(posedge clk) q <= s ? sum : dif;
+endmodule
+EOT
+
+hierarchy -top top
+proc
+opt
+techmap
+opt
+
+design -save gold
+abc -fast
+
+# 2. the fast recipe actually MAPPED -- assert on the live design, before it is
+#    stashed, or the selection has no module to resolve against.
+select -assert-min 1 t:$_XOR_
+select -assert-min 1 t:$_AND_
+
+design -stash gate
+
+# 3. equivalence against the pre-abc netlist
+design -copy-from gold -as gold top
+design -copy-from gate -as gate top
+equiv_make gold gate equiv
+equiv_simple
+equiv_status -assert
