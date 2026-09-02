@@ -19,7 +19,7 @@
 	url = https://github.com/MikePopoloski/slang
 [submodule "sv-elab"]
 	path = frontends/slang/lib
-	url = https://github.com/povik/sv-elab
+	url = https://github.com/vibeic/sv-elab
 [submodule "symfpu"]
 	path = libs/symfpu
 	url = https://github.com/YosysHQ/symfpu
